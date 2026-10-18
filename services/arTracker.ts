@@ -62,6 +62,15 @@ export function poseFromAngles(alphaDeg: number, betaDeg: number, gammaDeg: numb
   return { right: X, up: Y, forward };
 }
 
+/** Cap (degrés, sens horaire depuis +y) de la caméra, ou du haut du téléphone s'il est à plat. */
+function headingDeg(p: CameraPose): number | null {
+  const f = p.forward;
+  const u = p.up;
+  if (Math.hypot(f[0], f[1]) >= 0.5) return Math.atan2(f[0], f[1]) / DEG;
+  if (Math.hypot(u[0], u[1]) >= 0.5) return Math.atan2(u[0], u[1]) / DEG;
+  return null;
+}
+
 /** Moyenne pondérée de deux directions (a compte pour wA, b pour 1), renormalisée. */
 export const blendDir = (a: Vec3, b: Vec3, wA: number): Vec3 => norm(add(scale(a, wA), b));
 
@@ -71,9 +80,20 @@ export class OrientationSource {
   // Pose lissée de l'appareil (écran en portrait) : les capteurs tremblent, surtout la boussole ;
   // un lissage léger stabilise les repères sans retard perceptible.
   private smooth: { x: Vec3; y: Vec3; at: number } | null = null;
+  // Boussole : écart entre ce repère (orientation « relative », arbitraire au démarrage sur Chrome et Safari)
+  // et le nord. Sert seulement à orienter la maquette du bâtiment, pas aux repères à l'écran.
+  private northSin = 0;
+  private northCos = 0;
+  private northN = 0;
+  private absolute: { a: number; b: number; g: number; at: number } | null = null;
+  private absHandler = (e: DeviceOrientationEvent) => {
+    if (e.alpha === null || e.beta === null || e.gamma === null) return;
+    this.absolute = { a: e.alpha, b: e.beta, g: e.gamma, at: Date.now() };
+  };
   private handler = (e: DeviceOrientationEvent) => {
     if (e.alpha === null || e.beta === null || e.gamma === null) return;
     const raw = poseFromAngles(e.alpha, e.beta, e.gamma, 0);
+    this.sampleNorth(e, raw);
     const now = Date.now();
     const prev = this.smooth;
     if (!prev || now - prev.at > 500) {
@@ -105,10 +125,42 @@ export class OrientationSource {
 
   start(): void {
     window.addEventListener('deviceorientation', this.handler);
+    window.addEventListener('deviceorientationabsolute' as any, this.absHandler);
   }
 
   stop(): void {
     window.removeEventListener('deviceorientation', this.handler);
+    window.removeEventListener('deviceorientationabsolute' as any, this.absHandler);
+  }
+
+  /** Une mesure de l'écart au nord (iPhone : webkitCompassHeading ; Android : événement « absolu »). */
+  private sampleNorth(e: DeviceOrientationEvent, rel: CameraPose) {
+    const azRel = headingDeg(rel);
+    if (azRel === null) return;
+    let azAbs: number | null = null;
+    const ios = (e as any).webkitCompassHeading;
+    const iosAcc = (e as any).webkitCompassAccuracy;
+    if (e.absolute) azAbs = azRel; // repère déjà orienté au nord (Firefox)
+    else if (typeof ios === 'number' && ios >= 0 && !(typeof iosAcc === 'number' && (iosAcc < 0 || iosAcc > 40))) azAbs = ios;
+    else if (this.absolute && Date.now() - this.absolute.at < 300) {
+      azAbs = headingDeg(poseFromAngles(this.absolute.a, this.absolute.b, this.absolute.g, 0));
+    }
+    if (azAbs === null) return;
+    const off = (azRel - azAbs) * DEG;
+    // Moyenne circulaire glissante (la boussole est perturbée près des radiateurs et des structures métalliques)
+    const k = this.northN < 30 ? 1 / (this.northN + 1) : 1 / 30;
+    this.northSin = this.northSin * (1 - k) + Math.sin(off) * k;
+    this.northCos = this.northCos * (1 - k) + Math.cos(off) * k;
+    this.northN++;
+  }
+
+  /**
+   * Rotation (radians, sens trigonométrique) qui passe de ce repère au repère « x = est, y = nord » ;
+   * null si le téléphone n'a pas de boussole exploitable.
+   */
+  northOffset(): number | null {
+    if (this.northN < 8 || Math.hypot(this.northSin, this.northCos) < 0.5) return null;
+    return Math.atan2(this.northSin, this.northCos);
   }
 
   /** Pose actuelle, ou null si le téléphone ne fournit pas (ou plus) son orientation. */

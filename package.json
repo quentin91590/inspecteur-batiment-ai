@@ -11,17 +11,19 @@
     "demo": "VITE_AI_MOCK=1 vite"
   },
   "dependencies": {
-    "react-dom": "^19.2.1",
-    "react": "^19.2.1",
-    "lucide-react": "^0.556.0",
-    "jszip": "^3.10.1",
+    "docx": "8.5.0",
     "firebase": "^12.6.0",
     "jspdf": "2.5.1",
     "jspdf-autotable": "3.8.2",
-    "docx": "8.5.0"
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.556.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "three": "0.186.1"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
+    "@types/three": "0.186.0",
     "@vitejs/plugin-react": "^5.0.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"

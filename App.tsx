@@ -22,7 +22,7 @@ import { ModelSettingsModal } from './components/ModelSettingsModal';
 import { elementKey, getMissingAttributes } from './utils/checklist';
 import { uploadInspectionImage } from './services/storageService';
 import { generatePDF, generateDOCX } from './services/reportGenerator';
-import { InspectionItem, QueueItem, Building, SchemaDefinition, InspectionResult, AnalysisMeta } from './types';
+import { InspectionItem, QueueItem, Building, SchemaDefinition, InspectionResult, AnalysisMeta, BuildingLayout } from './types';
 import { DEFAULT_SCHEMA_CSV, CATEGORY_ORDER, sortCategories, AI_COSTS } from './constants';
 import { 
     Upload, Camera, PenTool, ChevronRight, ChevronDown, ChevronUp, PieChart, Image as ImageIcon, 
@@ -30,8 +30,11 @@ import {
     Thermometer, PaintBucket, Hammer, Building as BuildingIcon, Grid2x2, Home, 
     Trees, Car, FireExtinguisher, ShieldCheck, Wind, Droplets, Zap, Wifi, Lightbulb, 
     MoveVertical, Folder, BrickWall, LogOut, Loader2, ZapOff, Mic, StopCircle, Sparkles,
-    Wand2, BrainCircuit, Aperture, Activity, Diamond, FileText, Download, Video, Settings2
+    Wand2, BrainCircuit, Aperture, Activity, Diamond, FileText, Download, Video, Settings2, Box
 } from 'lucide-react';
+
+// Maquette 3D du bâtiment : chargée seulement à l'ouverture
+const Building3D = React.lazy(() => import('./components/Building3D'));
 
 // Helper to resize image - OPTIMIZED FOR FIRESTORE (0.6 quality)
 const resizeImage = (file: File): Promise<string> => {
@@ -260,6 +263,9 @@ export default function App() {
   const [schema, setSchema] = useState<SchemaDefinition>({});
   // Éléments du référentiel absents de ce bâtiment (« Catégorie::Élément »)
   const [absent, setAbsent] = useState<string[]>([]);
+  // Maquette 3D (pièces, éléments repérés, parcours), construite pendant les visites guidées
+  const [layout, setLayout] = useState<BuildingLayout | undefined>(undefined);
+  const [show3d, setShow3d] = useState(false);
   
   // === UI STATE ===
   const [isProcessingQueue, setIsProcessingQueue] = useState(false);
@@ -444,6 +450,8 @@ export default function App() {
         queue: [], // FORCE EMPTY QUEUE IN CLOUD
         schema,
         absent,
+        // Firestore refuse les valeurs « undefined » : on les retire
+        ...(layout ? { layout: JSON.parse(JSON.stringify(layout)) } : {}),
         updatedAt: Date.now(),
         isConfigured: buildingToSave.isConfigured || Object.keys(schema).length > 0
     };
@@ -471,7 +479,7 @@ export default function App() {
 
     return () => clearTimeout(timeoutId);
 
-  }, [items, queue, schema, absent, activeBuildingId, user]);
+  }, [items, queue, schema, absent, layout, activeBuildingId, user]);
 
   // === RÉSEAU (V2) ===
   useEffect(() => {
@@ -637,6 +645,7 @@ export default function App() {
     setQueue(building.queue || []);
     setSchema(building.schema || {});
     setAbsent(building.absent || []);
+    setLayout(building.layout);
     setQuotaExceeded(false);
 
     setTimeout(() => { isHydrating.current = false; }, 500);
@@ -648,6 +657,8 @@ export default function App() {
     const currentItems = items;
     // const currentQueue = queue; // IGNORE QUEUE
     const currentSchema = schema;
+    const currentAbsent = absent;
+    const currentLayout = layout;
 
     // 2. IMMEDIATE UI UPDATE: Navigate back to the list
     setActiveBuildingId(null);
@@ -665,6 +676,8 @@ export default function App() {
                 items: safeItems, 
                 queue: [], // FORCE EMPTY
                 schema: currentSchema,
+                absent: currentAbsent,
+                ...(currentLayout ? { layout: JSON.parse(JSON.stringify(currentLayout)) } : {}),
                 updatedAt: Date.now(),
                 isConfigured: buildingToSave.isConfigured || Object.keys(currentSchema).length > 0
              };
@@ -1701,7 +1714,16 @@ export default function App() {
           onCapture={handleGuidedCapture}
           onLeftoverSpeech={handleGuidedLeftoverSpeech}
           onClose={() => { setShowGuided(false); setIsQueueCollapsed(false); }}
+          layout={layout}
+          onLayoutChange={setLayout}
         />
+      )}
+
+      {/* V2 : MAQUETTE 3D DU BÂTIMENT */}
+      {show3d && layout && (
+        <React.Suspense fallback={<div className="fixed inset-0 z-[400] bg-[#0b1220] flex items-center justify-center"><Loader2 size={28} className="animate-spin text-white/70" /></div>}>
+          <Building3D layout={layout} onClose={() => setShow3d(false)} />
+        </React.Suspense>
       )}
 
       {/* V2 : CHOIX DES MODÈLES + BANC D'ESSAI */}
@@ -1912,6 +1934,22 @@ export default function App() {
                         {AI_COSTS.GUIDED_MINUTE} <Diamond size={10} />/min
                     </span>
                 </button>
+
+                {/* V2 : MAQUETTE 3D (après une visite guidée) */}
+                {layout && layout.rooms.length > 0 && (
+                    <button
+                        onClick={() => setShow3d(true)}
+                        className="w-full -mt-2 mb-4 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 text-sm font-semibold hover:border-blue-300 hover:bg-blue-50/40 transition-colors"
+                        data-testid="open-3d-main"
+                    >
+                        <Box size={18} className="text-blue-600 shrink-0" />
+                        <span className="flex-1 text-left">Maquette 3D</span>
+                        <span className="text-xs text-slate-400 font-medium">
+                            {layout.rooms.length} pièce{layout.rooms.length > 1 ? 's' : ''} · {layout.elements.length} élément{layout.elements.length > 1 ? 's' : ''}
+                        </span>
+                        <ChevronRight size={16} className="text-slate-400 shrink-0" />
+                    </button>
+                )}
 
                 <div className="grid grid-cols-3 gap-4 mt-2">
                     {/* IMPORT */}
