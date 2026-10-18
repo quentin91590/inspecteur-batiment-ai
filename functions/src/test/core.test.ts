@@ -67,7 +67,7 @@ const GUIDE_OK = {
 };
 
 describe('guidage', () => {
-  it('Gemini Flash-Lite par défaut : réflexion minimale, schéma JSON, image avant le texte', async () => {
+  it('Gemini 3.5 Flash-Lite par défaut : réflexion minimale, schéma JSON, image avant le texte', async () => {
     captured.length = 0;
     nextReply = () => geminiReply(GUIDE_OK);
     const res = await handleAiRequest(
@@ -75,9 +75,9 @@ describe('guidage', () => {
       'u1', deps(),
     );
     assert.equal(res.guide?.instruction, GUIDE_OK.instruction);
-    assert.equal(res.meta?.model, 'gemini:gemini-3.1-flash-lite');
+    assert.equal(res.meta?.model, 'gemini:gemini-3.5-flash-lite');
     const c = captured[0];
-    assert.match(c.url, /models\/gemini-3\.1-flash-lite:generateContent/);
+    assert.match(c.url, /models\/gemini-3\.5-flash-lite:generateContent/);
     assert.equal(c.body.generationConfig.thinkingConfig.thinkingLevel, 'MINIMAL');
     assert.equal(c.body.generationConfig.responseMimeType, 'application/json');
     assert.ok(!JSON.stringify(c.body.generationConfig.responseJsonSchema).includes('additionalProperties'));
@@ -117,7 +117,7 @@ describe('guidage', () => {
       { task: 'guide', image: IMG, schema: SCHEMA, zone: 'Tout', missing: [], inProgress: [], model: 'anthropic:modele-inexistant' },
       'u1', deps(),
     );
-    assert.equal(res.meta?.model, 'gemini:gemini-3.1-flash-lite');
+    assert.equal(res.meta?.model, 'gemini:gemini-3.5-flash-lite');
   });
 
   it('réponse incomplète → valeurs par défaut sûres', async () => {
@@ -137,10 +137,10 @@ describe('analyse détaillée', () => {
     ],
   };
 
-  it('Gemini 3 Flash (défaut V1) : réflexion par défaut, référentiel complet dans le système, note orale transmise', async () => {
+  it('Gemini 3 Flash choisi dans l\'appli : réflexion par défaut, référentiel complet dans le système, note orale transmise', async () => {
     captured.length = 0;
     nextReply = () => geminiReply(ELEMENTS);
-    const res = await handleAiRequest({ task: 'analyzeImage', image: IMG, schema: SCHEMA, note: 'marque Viessmann', hint: 'Production de chaleur — plaque' }, 'u1', deps());
+    const res = await handleAiRequest({ task: 'analyzeImage', image: IMG, schema: SCHEMA, note: 'marque Viessmann', hint: 'Production de chaleur — plaque', model: 'gemini:gemini-3-flash-preview' }, 'u1', deps());
     const c = captured[0];
     assert.match(c.url, /gemini-3-flash-preview:generateContent/);
     assert.equal(c.body.generationConfig.thinkingConfig, undefined);
@@ -200,7 +200,8 @@ describe('note vocale, synthèse, modèles, erreurs', () => {
     const qwen = res.models?.find(m => m.id === 'openai:qwen3.8-omni-flash');
     assert.equal(haiku?.available, false);
     assert.equal(qwen?.available, true);
-    assert.equal(res.defaults?.guide, 'gemini:gemini-3.1-flash-lite');
+    assert.equal(res.defaults?.guide, 'gemini:gemini-3.5-flash-lite');
+    assert.equal(res.defaults?.analyze, 'gemini:gemini-3.5-flash-lite');
   });
 
   it('seule la clé Claude est configurée → les défauts basculent sur Claude', async () => {

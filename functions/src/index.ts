@@ -1,7 +1,7 @@
 import { initializeApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import * as logger from 'firebase-functions/logger';
-import { defineBoolean, defineInt, defineSecret, defineString } from 'firebase-functions/params';
+import { defineBoolean, defineInt, defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall } from 'firebase-functions/v2/https';
 import { AiError, handleAiRequest, type CoreDeps, type RemoteConfig } from './core.js';
 import type { AiMeta, Purpose } from './types.js';
@@ -9,20 +9,11 @@ import type { AiMeta, Purpose } from './types.js';
 initializeApp();
 const db = getFirestore();
 
-// --- Clés (Secret Manager). Mettre « none » pour un fournisseur non utilisé.
+// --- Clé Gemini (Secret Manager). Pour l'instant tout passe par Google.
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
-const ANTHROPIC_API_KEY = defineSecret('ANTHROPIC_API_KEY');
-const OPENAI_COMPAT_API_KEY = defineSecret('OPENAI_COMPAT_API_KEY');
-
-// --- Paramètres (fichier functions/.env ou invite au déploiement)
-const OPENAI_COMPAT_BASE_URL = defineString('OPENAI_COMPAT_BASE_URL', {
-  default: '',
-  description: "URL d'un fournisseur compatible OpenAI (ex : https://dashscope-intl.aliyuncs.com/compatible-mode/v1). Vide = désactivé.",
-});
-const OPENAI_COMPAT_MODELS = defineString('OPENAI_COMPAT_MODELS', {
-  default: '',
-  description: 'Modèles de ce fournisseur, séparés par des virgules (id|Libellé).',
-});
+// Pour réactiver Claude ou un fournisseur compatible OpenAI (Qwen, Infomaniak…) plus tard :
+//   const ANTHROPIC_API_KEY = defineSecret('ANTHROPIC_API_KEY');  + l'ajouter à `secrets` et à `keys` ci-dessous
+//   const OPENAI_COMPAT_API_KEY = defineSecret('OPENAI_COMPAT_API_KEY');  + OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_MODELS (defineString)
 const ENFORCE_APP_CHECK = defineBoolean('ENFORCE_APP_CHECK', { default: false });
 const MIN_INSTANCES = defineInt('AI_MIN_INSTANCES', { default: 0 });
 
@@ -76,7 +67,7 @@ function recordUsage(uid: string, purpose: Purpose, meta: AiMeta): void {
 export const ai = onCall(
   {
     region: 'europe-west6', // Zurich
-    secrets: [GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_COMPAT_API_KEY],
+    secrets: [GEMINI_API_KEY],
     enforceAppCheck: ENFORCE_APP_CHECK,
     minInstances: MIN_INSTANCES,
     memory: '512MiB',
@@ -87,13 +78,7 @@ export const ai = onCall(
     if (!request.auth) throw new HttpsError('unauthenticated', 'Connexion requise pour utiliser l’IA.');
 
     const deps: CoreDeps = {
-      keys: {
-        gemini: GEMINI_API_KEY.value(),
-        anthropic: ANTHROPIC_API_KEY.value(),
-        openai: OPENAI_COMPAT_API_KEY.value(),
-        openaiBaseUrl: OPENAI_COMPAT_BASE_URL.value(),
-      },
-      openaiModels: OPENAI_COMPAT_MODELS.value(),
+      keys: { gemini: GEMINI_API_KEY.value() },
       loadConfig,
       checkQuota,
       recordUsage,

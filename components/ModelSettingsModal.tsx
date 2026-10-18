@@ -142,9 +142,9 @@ export const ModelSettingsModal: React.FC<Props> = ({ schema, userCoins, onSpend
                     className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-800"
                   >
                     <option value="">Par défaut du serveur ({labelOf(defaults[p.key])})</option>
-                    {models.map(m => (
-                      <option key={m.id} value={m.id} disabled={!m.available}>
-                        {m.label}{m.note ? ` — ${m.note}` : ''}{m.available ? '' : ' (clé non configurée)'}
+                    {available.map(m => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}{m.note ? ` — ${m.note}` : ''}
                       </option>
                     ))}
                   </select>
