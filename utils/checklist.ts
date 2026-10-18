@@ -3,6 +3,9 @@ import type { InspectionItem, QueueItem, SchemaDefinition } from '../types';
 export const ALL_ZONES = '__ALL__';
 export const ALL_ZONES_LABEL = 'Tout le bâtiment';
 
+/** Clé d'un élément du référentiel (pour la liste des éléments absents du bâtiment). */
+export const elementKey = (category: string, subCategory: string) => `${category}::${subCategory}`;
+
 /** Catégories qui ne se filment pas (nombres, surfaces) : ignorées par la visite guidée. */
 export const NON_VISUAL_CATEGORIES = ['Administratif'];
 
@@ -36,7 +39,7 @@ export function buildChecklist(
   schema: SchemaDefinition,
   items: Record<string, InspectionItem>,
   zone: string,
-  opts: { visualOnly?: boolean } = {},
+  opts: { visualOnly?: boolean; absent?: string[] } = {},
 ): Checklist {
   const all = Object.values(items);
   const cats = (zone === ALL_ZONES ? Object.keys(schema) : [zone].filter(c => schema[c])).filter(
@@ -45,6 +48,7 @@ export function buildChecklist(
   const entries: ChecklistEntry[] = [];
   for (const cat of cats) {
     for (const sub of Object.keys(schema[cat] ?? {})) {
+      if (opts.absent?.includes(elementKey(cat, sub))) continue; // absent du bâtiment : rien à relever
       const item = all.find(i => i.category === cat && i.subCategory === sub);
       if (!item) {
         entries.push({ category: cat, subCategory: sub, status: 'absent', missingAttributes: Object.keys(schema[cat][sub]) });

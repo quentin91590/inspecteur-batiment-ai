@@ -19,7 +19,7 @@ import { analyzeInspectionImage, analyzeInspectionText, summarizeInspectionComme
 import { loadLocalQueue, saveLocalQueue } from './services/localQueue';
 import { GuidedVisit, type CaptureAnalysis, type GuidedCapture } from './components/GuidedVisit';
 import { ModelSettingsModal } from './components/ModelSettingsModal';
-import { getMissingAttributes } from './utils/checklist';
+import { elementKey, getMissingAttributes } from './utils/checklist';
 import { uploadInspectionImage } from './services/storageService';
 import { generatePDF, generateDOCX } from './services/reportGenerator';
 import { InspectionItem, QueueItem, Building, SchemaDefinition, InspectionResult, AnalysisMeta } from './types';
@@ -258,6 +258,8 @@ export default function App() {
   const [items, setItems] = useState<Record<string, InspectionItem>>({});
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [schema, setSchema] = useState<SchemaDefinition>({});
+  // Éléments du référentiel absents de ce bâtiment (« Catégorie::Élément »)
+  const [absent, setAbsent] = useState<string[]>([]);
   
   // === UI STATE ===
   const [isProcessingQueue, setIsProcessingQueue] = useState(false);
@@ -441,6 +443,7 @@ export default function App() {
         items: safeItems,
         queue: [], // FORCE EMPTY QUEUE IN CLOUD
         schema,
+        absent,
         updatedAt: Date.now(),
         isConfigured: buildingToSave.isConfigured || Object.keys(schema).length > 0
     };
@@ -468,7 +471,7 @@ export default function App() {
 
     return () => clearTimeout(timeoutId);
 
-  }, [items, queue, schema, activeBuildingId, user]);
+  }, [items, queue, schema, absent, activeBuildingId, user]);
 
   // === RÉSEAU (V2) ===
   useEffect(() => {
@@ -633,6 +636,7 @@ export default function App() {
     setItems(building.items || {});
     setQueue(building.queue || []);
     setSchema(building.schema || {});
+    setAbsent(building.absent || []);
     setQuotaExceeded(false);
 
     setTimeout(() => { isHydrating.current = false; }, 500);
@@ -1546,7 +1550,7 @@ export default function App() {
       const categoryStats: Record<string, { total: number, detected: number, completed: number }> = {};
       
       Object.entries(schema).forEach(([cat, subCats]) => {
-          const subs = Object.keys(subCats);
+          const subs = Object.keys(subCats).filter(sub => !absent.includes(elementKey(cat, sub))); // absents : hors avancement
           categoryStats[cat] = { total: subs.length, detected: 0, completed: 0 };
           
           subs.forEach(sub => {
@@ -1566,7 +1570,7 @@ export default function App() {
       // Percentage based on COMPLETED items
       const percent = schemaItemCount > 0 ? Math.round((completedItemCount / schemaItemCount) * 100) : 0;
       return { totalPhotos, schemaItemCount, completedItemCount, percent, categoryStats };
-  }, [items, schema]);
+  }, [items, schema, absent]);
 
   const activeBuilding = buildings.find(b => b.id === activeBuildingId);
   const allCategories = useMemo(() => {
@@ -1594,7 +1598,7 @@ export default function App() {
       Object.keys(schema).forEach(cat => {
           const allSubCats = Object.keys(schema[cat] || {});
           const existingSubCats = Object.keys(groupedItems[cat] || {});
-          const missingForCat = allSubCats.filter(sub => !existingSubCats.includes(sub));
+          const missingForCat = allSubCats.filter(sub => !existingSubCats.includes(sub) && !absent.includes(elementKey(cat, sub)));
           missingForCat.forEach(sub => missing.push({ category: cat, subCategory: sub }));
       });
       
@@ -1605,7 +1609,7 @@ export default function App() {
           if (catCompare[0] === b.category && a.category !== b.category) return 1;
           return a.subCategory.localeCompare(b.subCategory);
       });
-  }, [schema, groupedItems]);
+  }, [schema, groupedItems, absent]);
 
   // Logic for UI disables based on balance
   const canAffordImage = userCoins >= AI_COSTS.IMAGE_ANALYSIS;
@@ -1686,6 +1690,10 @@ export default function App() {
           items={items}
           queue={queue}
           captureResults={captureResults}
+          absent={absent}
+          onSetAbsent={(key, isAbsent) =>
+            setAbsent(prev => (isAbsent ? Array.from(new Set([...prev, key])) : prev.filter(k => k !== key)))
+          }
           isOffline={isOffline}
           demoMode={isDemoMode()}
           userCoins={userCoins}
@@ -2245,7 +2253,9 @@ export default function App() {
 
                 const allSubCatsForThisCategory = Object.keys(schema[cat] || {});
                 const existingSubCatsForThisCategory = Object.keys(subCats);
-                const missingSubCats = allSubCatsForThisCategory.filter(sub => !existingSubCatsForThisCategory.includes(sub));
+                const missingSubCats = allSubCatsForThisCategory.filter(
+                    sub => !existingSubCatsForThisCategory.includes(sub) && !absent.includes(elementKey(cat, sub)),
+                );
                 
                 const showMissingHere = activeCategory !== 'ALL' && missingSubCats.length > 0;
                 

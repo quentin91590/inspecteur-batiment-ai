@@ -74,5 +74,8 @@ export interface Building {
   // New Schema Structure
   schema: SchemaDefinition;
 
+  /** Éléments du référentiel absents de ce bâtiment (« Catégorie::Élément ») : exclus de ce qui reste à faire */
+  absent?: string[];
+
   isConfigured: boolean;
 }

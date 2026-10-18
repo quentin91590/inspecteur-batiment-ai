@@ -12,6 +12,7 @@ import {
 import { PARCOURS_STAGES, stageText } from '../utils/visit';
 import { protocolFor, type Protocol } from '../utils/protocols';
 import { iconFor } from '../utils/elementIcons';
+import { ReferentielPanel, type SpottedVariant } from './ReferentielPanel';
 import { AiCallError, checkStepPhoto, guideFrame, modelLabel, type AiMeta, type GuideResult, type PhotoCheck } from '../services/aiService';
 import { LOW_LIGHT_FILTER, grabJpeg, grayFrame, meanAbsDiff, meanLuma, smallGray } from '../services/videoFrames';
 import {
@@ -43,7 +44,7 @@ const HD_MAX_SIDE = 1280;         // photo analysée en détail
 const DARK_LUMA = 38;
 const TRACK_EVERY_MS = 120;       // recalage du cadre par l'image
 const MAX_POINTS = 30;            // repères par pièce
-const SAME_DIR_DEG = 12;          // même élément signalé sous un autre nom s'il est dans la même direction
+const SAME_DIR_DEG = 30;          // même élément signalé sous un autre nom s'il est dans la même direction
 const RECENT_BOX_MS = 2500;       // sans gyroscope, un repère n'est affiché que peu après avoir été vu
 const SPEECH_HINT_MS = 9000;
 const MAX_DIGITAL_ZOOM = 4;       // zoom numérique (recadrage) quand le téléphone ne pilote pas le zoom
@@ -65,6 +66,9 @@ interface Props {
   queue: QueueItem[];
   /** Analyses détaillées terminées des photos de la visite, par identifiant de photo */
   captureResults: Record<string, CaptureAnalysis>;
+  /** Éléments absents du bâtiment (« Catégorie::Élément ») */
+  absent: string[];
+  onSetAbsent: (key: string, isAbsent: boolean) => void;
   isOffline: boolean;
   demoMode: boolean;
   userCoins: number;
@@ -161,6 +165,7 @@ interface SpacePoint {
 }
 
 interface RoomState {
+  name: string;
   points: SpacePoint[];
   doneHere: string[];
 }
@@ -204,6 +209,24 @@ const resolveKey = (keys: string[], name: string): string | null => {
   );
 };
 
+/** Deux libellés désignent-ils la même variante ? (« Fenêtre bois » / « Fenêtre en bois », « Parquet chêne clair » / « Parquet chêne ») */
+const STOP_WORDS = new Set(['de', 'du', 'des', 'en', 'la', 'le', 'les', 'l', 'd', 'a', 'et', 'avec', 'type']);
+const labelTokens = (s: string) => normText(s).split(/[^a-z0-9]+/).filter(t => t && !STOP_WORDS.has(t));
+const similarLabels = (a: string, b: string) => {
+  const na = normText(a);
+  const nb = normText(b);
+  if (!na || !nb) return false;
+  if (na === nb || na.includes(nb) || nb.includes(na)) return true;
+  const ta = new Set(labelTokens(a));
+  const tb = new Set(labelTokens(b));
+  if (!ta.size || !tb.size) return false;
+  let common = 0;
+  ta.forEach(t => {
+    if (tb.has(t)) common++;
+  });
+  return common / Math.min(ta.size, tb.size) >= 0.67;
+};
+
 const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Zoom de la caméra : matériel si le téléphone le permet (meilleure netteté), sinon numérique. */
@@ -237,7 +260,7 @@ const fmtSeconds = (ms?: number) => (ms === undefined ? '' : `${(ms / 1000).toFi
 const sameText = (a?: string, b?: string) => !!a && !!b && normText(a) === normText(b);
 
 export const GuidedVisit: React.FC<Props> = ({
-  schema, items, queue, captureResults, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
+  schema, items, queue, captureResults, absent, onSetAbsent, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
 }) => {
   // ---------------------------------------------------------------- état affiché
   const [phase, setPhase] = useState<'setup' | 'running' | 'summary'>('setup');
@@ -274,6 +297,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const [doneElements, setDoneElements] = useState<DoneElement[]>([]);
   const [roomPoints, setRoomPoints] = useState<SpacePoint[]>([]);
   const [roomListOpen, setRoomListOpen] = useState(false);
+  const [roomTab, setRoomTab] = useState<'piece' | 'ref'>('piece');
   const [speechHint, setSpeechHint] = useState(false);
   const [spokenSent, setSpokenSent] = useState(false);
   const [autoCapture, setAutoCapture] = useState(readAutoCapture);
@@ -308,8 +332,8 @@ export const GuidedVisit: React.FC<Props> = ({
   const arrowIconRef = useRef<HTMLDivElement>(null);
   const arrowLabelRef = useRef<HTMLSpanElement>(null);
 
-  const propsRef = useRef({ schema, items, queue, userCoins, isOffline });
-  propsRef.current = { schema, items, queue, userCoins, isOffline };
+  const propsRef = useRef({ schema, items, queue, userCoins, isOffline, absent });
+  propsRef.current = { schema, items, queue, userCoins, isOffline, absent };
   // Callbacks du parent lus via des refs : les boucles ne sont pas recréées à chaque rendu de l'écran principal
   const onCaptureRef = useRef(onCapture);
   onCaptureRef.current = onCapture;
@@ -372,7 +396,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
   // ---------------------------------------------------------------- thèmes et progression
   const themes = useMemo(() => sortCategories(Object.keys(schema)).filter(c => !NON_VISUAL_CATEGORIES.includes(c)), [schema]);
-  const checklist = useMemo(() => buildChecklist(schema, items, theme, { visualOnly: true }), [schema, items, theme]);
+  const checklist = useMemo(() => buildChecklist(schema, items, theme, { visualOnly: true, absent }), [schema, items, theme, absent]);
   const themeLabel = theme === ALL_ZONES ? ALL_ZONES_LABEL : theme;
 
   const showToast = useCallback((msg: string) => {
@@ -836,7 +860,7 @@ export const GuidedVisit: React.FC<Props> = ({
   /** Mémorise les repères de la pièce actuelle (pour y revenir et pour le bilan). */
   const saveRoom = useCallback(() => {
     const name = visitRef.current.currentSpace;
-    if (name) roomsRef.current.set(normText(name), { points: pointsRef.current, doneHere: doneHereRef.current });
+    if (name) roomsRef.current.set(normText(name), { name, points: pointsRef.current, doneHere: doneHereRef.current });
   }, []);
 
   /** Nouvelle pièce : ses repères repartent de zéro (ou de ceux mémorisés si on y revient). */
@@ -845,7 +869,7 @@ export const GuidedVisit: React.FC<Props> = ({
     const prev = pointsRef.current;
     if (!prevName) {
       // Pièce identifiée pour la première fois : les repères déjà posés sont les siens
-      roomsRef.current.set(normText(name), { points: prev, doneHere: doneHereRef.current });
+      roomsRef.current.set(normText(name), { name, points: prev, doneHere: doneHereRef.current });
     } else {
       const staying = prev;
       // L'élément en cours appartient à la pièce quittée : il reste à faire là-bas
@@ -861,7 +885,7 @@ export const GuidedVisit: React.FC<Props> = ({
         setPendingCapture(false);
         setInstruction(null);
       }
-      roomsRef.current.set(normText(prevName), { points: staying, doneHere: doneHereRef.current });
+      roomsRef.current.set(normText(prevName), { name: prevName, points: staying, doneHere: doneHereRef.current });
       const saved = roomsRef.current.get(normText(name));
       pointsRef.current = saved?.points ?? [];
       doneHereRef.current = saved?.doneHere ?? [];
@@ -889,7 +913,10 @@ export const GuidedVisit: React.FC<Props> = ({
     const cand = spaceCandidateRef.current;
     if (cand && sameText(cand.name, name)) {
       cand.count++;
-      if (cand.count >= 2) {
+      // Après « Pièce suivante », deux réponses suffisent ; sinon on en veut trois : l'IA peut croire voir une autre
+      // pièce quand on se retourne, et on perdrait les repères (verts) de la pièce où l'on est toujours
+      const leaving = !!leavingRef.current && Date.now() < leavingRef.current.until;
+      if (cand.count >= (leaving ? 2 : 3)) {
         spaceCandidateRef.current = null;
         enterSpace(name);
       }
@@ -954,7 +981,10 @@ export const GuidedVisit: React.FC<Props> = ({
       const box = uncrop(boxFromArray(e.box), zoom.d);
       const dir = pose ? unproject(box.cx, box.cy, pose, fov) : null;
       const pts = pointsRef.current;
+      // Même variante : même libellé (ou presque), sinon même élément au même endroit. Un élément déjà fait
+      // reste vert quand on le revoit, même si l'IA le nomme un peu autrement.
       let pt = pts.find(q => q.category === category && sameText(q.label, label));
+      if (!pt) pt = pts.find(q => q.category === category && q.element === element && similarLabels(q.label, label));
       if (!pt && dir) pt = pts.find(q => q.category === category && q.element === element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
       if (pt) {
         matched.add(pt.id);
@@ -1227,6 +1257,40 @@ export const GuidedVisit: React.FC<Props> = ({
     if (pointsRef.current.some(q => q.id === id)) setSheetPointId(id);
   };
 
+  /** Tout ce qui a été repéré pendant la visite, pièce par pièce (pour le référentiel). */
+  const spottedVariants = (): SpottedVariant[] => {
+    const out: SpottedVariant[] = [];
+    const here = normText(visitRef.current.currentSpace || '');
+    const add = (pts: SpacePoint[], room: string) => {
+      for (const pt of pts) if (pt.status !== 'rejected') out.push({ category: pt.category, element: pt.element, label: pt.label, room, status: pt.status });
+    };
+    for (const [key, room] of roomsRef.current) if (key !== here) add(room.points, room.name);
+    add(pointsRef.current, visitRef.current.currentSpace || '');
+    return out;
+  };
+
+  /** « Relever maintenant » depuis le référentiel : le repère de cet élément s'il y en a un ici, sinon un nouveau. */
+  const startFromReferentiel = (category: string, element: string) => {
+    const here = pointsRef.current.find(
+      pt => pt.category === category && pt.element === element && (pt.status === 'todo' || pt.status === 'skipped'),
+    );
+    setRoomListOpen(false);
+    if (here) {
+      here.n = Math.max(here.n, 2);
+      choosePoint(here.id, true);
+      return;
+    }
+    const base = element || protocolFor(category, element).title;
+    const taken = (l: string) => pointsRef.current.some(pt => sameText(pt.label, l));
+    let label = base;
+    for (let i = 2; taken(label); i++) label = `${base} ${i}`;
+    leavingRef.current = null;
+    releaseActive('todo');
+    const pt = addPoint({ category, element, label, dir: null, box: null });
+    pt.n = 2; // choisi par l'inspecteur : pas besoin de confirmation
+    startPoint(pt);
+  };
+
   /** L'inspecteur choisit lui-même l'étape (puce de la liste des photos à prendre). */
   const jumpToStep = (idx: number) => {
     const a = activeRef.current;
@@ -1333,7 +1397,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
     const { schema: sch, items: its, queue: q } = propsRef.current;
     const v = visitRef.current;
-    const list = buildChecklist(sch, its, v.theme, { visualOnly: true });
+    const list = buildChecklist(sch, its, v.theme, { visualOnly: true, absent: propsRef.current.absent });
     const recentTargets = capturesRef.current.filter(c => c.target && Date.now() - c.at < 120_000).map(c => c.target);
     const transcript = speechBufferRef.current;
     speechBufferRef.current = '';
@@ -2056,7 +2120,7 @@ export const GuidedVisit: React.FC<Props> = ({
           <p className="text-sm font-semibold text-white/85 mb-2">Thème (facultatif)</p>
           <div className="flex flex-wrap gap-2">
             {[ALL_ZONES, ...themes].map(t => {
-              const cl = buildChecklist(schema, items, t, { visualOnly: true });
+              const cl = buildChecklist(schema, items, t, { visualOnly: true, absent });
               const on = t === theme;
               return (
                 <button
@@ -2353,6 +2417,7 @@ export const GuidedVisit: React.FC<Props> = ({
                 · <ListChecks size={13} /> {roomDone}/{roomVisible.length}
               </span>
             )}
+            <ChevronDown size={14} className="shrink-0 text-white/50" />
           </button>
           <button
             onClick={() => void toggleLight()}
@@ -2763,12 +2828,39 @@ export const GuidedVisit: React.FC<Props> = ({
             onClick={e => e.stopPropagation()}
             data-testid="room-list"
           >
-            <div className="flex items-center justify-between gap-2 mb-1">
-              <p className="font-bold text-lg truncate">{currentSpace || 'Pièce actuelle'}</p>
+            <div className="flex items-center gap-2 mb-3">
+              <div className="flex-1 min-w-0 grid grid-cols-2 gap-1 p-1 rounded-xl bg-white/10 text-sm font-semibold">
+                <button
+                  onClick={() => setRoomTab('piece')}
+                  className={`py-1.5 rounded-lg truncate px-2 ${roomTab === 'piece' ? 'bg-white text-slate-900' : 'text-white/75'}`}
+                  data-testid="tab-piece"
+                >
+                  {currentSpace || 'Cette pièce'}
+                  {roomVisible.length ? ` · ${roomDone}/${roomVisible.length}` : ''}
+                </button>
+                <button
+                  onClick={() => setRoomTab('ref')}
+                  className={`py-1.5 rounded-lg ${roomTab === 'ref' ? 'bg-white text-slate-900' : 'text-white/75'}`}
+                  data-testid="tab-ref"
+                >
+                  Référentiel
+                </button>
+              </div>
               <button onClick={() => setRoomListOpen(false)} className="p-2 rounded-full bg-white/10 shrink-0" aria-label="Fermer la liste">
                 <X size={18} />
               </button>
             </div>
+            {roomTab === 'ref' ? (
+              <ReferentielPanel
+                schema={schema}
+                items={items}
+                absent={absent}
+                spotted={spottedVariants()}
+                onStart={startFromReferentiel}
+                onSetAbsent={onSetAbsent}
+              />
+            ) : (
+            <>
             <p className="text-xs text-white/60 mb-3">
               {roomVisible.length
                 ? `${roomDone}/${roomVisible.length} éléments faits · touchez un élément jaune pour le relever, vert pour voir ce qui a été relevé`
@@ -2817,6 +2909,8 @@ export const GuidedVisit: React.FC<Props> = ({
                 );
               })}
             </ul>
+            </>
+            )}
           </div>
         </div>
       )}

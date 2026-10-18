@@ -31,7 +31,7 @@ const RULES: [RegExp, LucideIcon][] = [
   [/parquet|plancher|\bsols?\b|moquette|lino|stratifie/, Rows3],
   [/peinture|mur|crepi|papier peint|enduit|plafond/, PaintRoller],
   [/revetement|surface/, Layers],
-  [/maconnerie|beton|brique|gros.?oeuvre|structure|fissure/, BrickWall],
+  [/maconnerie|beton|brique|\bgros\b|structure|fissure/, BrickWall],
   [/facade|batiment/, Building2],
   [/toiture|toit|charpente|comble|couverture|isolation/, House],
   [/parking|garage/, Car],
