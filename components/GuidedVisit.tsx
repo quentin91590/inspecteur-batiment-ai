@@ -115,6 +115,11 @@ export const GuidedVisit: React.FC<Props> = ({
 
   const propsRef = useRef({ schema, items, queue, userCoins, isOffline });
   propsRef.current = { schema, items, queue, userCoins, isOffline };
+  // Callbacks du parent lus via des refs : la boucle de guidage n'est pas recréée à chaque rendu de l'écran principal
+  const onCaptureRef = useRef(onCapture);
+  onCaptureRef.current = onCapture;
+  const onSpendCoinsRef = useRef(onSpendCoins);
+  onSpendCoinsRef.current = onSpendCoins;
   const zoneRef = useRef(zone);
   zoneRef.current = zone;
   const pausedRef = useRef(paused);
@@ -312,7 +317,7 @@ export const GuidedVisit: React.FC<Props> = ({
     const note = speechSinceCaptureRef.current.trim();
     speechSinceCaptureRef.current = '';
     try {
-      const ok = await onCapture({ id, imageBase64: hd, note, target });
+      const ok = await onCaptureRef.current({ id, imageBase64: hd, note, target });
       if (!ok) {
         speechSinceCaptureRef.current = `${note} ${speechSinceCaptureRef.current}`.trim();
         return;
@@ -332,7 +337,7 @@ export const GuidedVisit: React.FC<Props> = ({
     } finally {
       capturingRef.current = false;
     }
-  }, [onCapture, showToast]);
+  }, [showToast]);
 
   const requestCapture = useCallback((target: string) => {
     const now = Date.now();
@@ -475,9 +480,9 @@ export const GuidedVisit: React.FC<Props> = ({
       setBlockMsg(`Crédits insuffisants pour poursuivre le guidage (${AI_COSTS.GUIDED_MINUTE} crédits par minute).`);
       return;
     }
-    const ok = await onSpendCoins(AI_COSTS.GUIDED_MINUTE);
+    const ok = await onSpendCoinsRef.current(AI_COSTS.GUIDED_MINUTE);
     if (!ok) setBlockMsg('Crédits insuffisants pour poursuivre le guidage.');
-  }, [onSpendCoins]);
+  }, []);
 
   // Une minute est due dès qu'elle commence ; une pause ne remet pas le compteur à zéro.
   const lastChargeAtRef = useRef(0);
