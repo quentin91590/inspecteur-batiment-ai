@@ -17,7 +17,7 @@ import { BuildingListScreen } from './components/BuildingListScreen';
 import { LoginScreen } from './components/LoginScreen'; 
 import { analyzeInspectionImage, analyzeInspectionText, summarizeInspectionComment, setDemoMode, isDemoMode, listModels, modelLabel, getModelPrefs, AiCallError, type AnalysisOutput } from './services/aiService';
 import { loadLocalQueue, saveLocalQueue } from './services/localQueue';
-import { GuidedVisit, type GuidedCapture } from './components/GuidedVisit';
+import { GuidedVisit, type CaptureAnalysis, type GuidedCapture } from './components/GuidedVisit';
 import { ModelSettingsModal } from './components/ModelSettingsModal';
 import { getMissingAttributes } from './utils/checklist';
 import { uploadInspectionImage } from './services/storageService';
@@ -291,6 +291,8 @@ export default function App() {
 
   // V2 : VISITE GUIDÉE + CHOIX DES MODÈLES
   const [showGuided, setShowGuided] = useState(false);
+  // Résultat de l'analyse de chaque photo de la visite guidée (affiché dans la fiche de l'élément)
+  const [captureResults, setCaptureResults] = useState<Record<string, CaptureAnalysis>>({});
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [analysisModelLabel, setAnalysisModelLabel] = useState<string>('');
   const [networkRetryAt, setNetworkRetryAt] = useState(0);
@@ -1290,6 +1292,9 @@ export default function App() {
           });
           
           updateProgress("Terminé");
+          if (queueItem.source === 'guided') {
+              setCaptureResults(prev => ({ ...prev, [queueItem.id]: { results, primary: Math.max(0, photoTargetIndex) } }));
+          }
           
           // Success: Remove from queue
           setQueue(prev => prev.filter(i => i.id !== queueItem.id));
@@ -1680,6 +1685,7 @@ export default function App() {
           schema={schema}
           items={items}
           queue={queue}
+          captureResults={captureResults}
           isOffline={isOffline}
           demoMode={isDemoMode()}
           userCoins={userCoins}

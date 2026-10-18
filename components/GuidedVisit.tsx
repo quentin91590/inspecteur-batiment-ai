@@ -2,9 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X, Pause, Play, Mic, MicOff, Flashlight, FlashlightOff, SunMedium, WifiOff, Loader2, CheckCircle2,
   AlertTriangle, ChevronDown, ChevronRight, Sparkles, Sun, ZoomIn, ZoomOut, Focus, Hand, Clock, MapPin,
-  Route, ArrowRight, Navigation, DoorOpen, SkipForward, ListChecks,
+  Route, ArrowRight, Navigation, DoorOpen, SkipForward, ListChecks, MoreHorizontal, Camera, Images,
 } from 'lucide-react';
-import type { InspectionItem, QueueItem, SchemaDefinition } from '../types';
+import type { InspectionItem, InspectionResult, QueueItem, SchemaDefinition } from '../types';
 import { AI_COSTS, sortCategories } from '../constants';
 import {
   ALL_ZONES, ALL_ZONES_LABEL, NON_VISUAL_CATEGORIES, buildChecklist, inProgressTargets, missingLines, recordedLines,
@@ -58,6 +58,8 @@ interface Props {
   schema: SchemaDefinition;
   items: Record<string, InspectionItem>;
   queue: QueueItem[];
+  /** Analyses détaillées terminées des photos de la visite, par identifiant de photo */
+  captureResults: Record<string, CaptureAnalysis>;
   isOffline: boolean;
   demoMode: boolean;
   userCoins: number;
@@ -82,6 +84,17 @@ interface SessionCapture {
   target: string;
   thumb: string;
   at: number;
+  /** Repère (élément) et étape photographiés */
+  pointId?: string;
+  title?: string;
+  stepLabel?: string;
+}
+
+/** Résultat de l'analyse détaillée d'une photo de la visite (transmis par l'écran principal) */
+export interface CaptureAnalysis {
+  results: InspectionResult[];
+  /** Résultat correspondant au sujet principal de la photo */
+  primary: number;
 }
 
 interface SpaceVisit {
@@ -102,17 +115,13 @@ interface ActiveElement {
   runId: string;
   /** Étapes réglées : photo prise, absente ou passée */
   resolved: number[];
+  /** Comment chaque étape réglée l'a été */
+  outcomes: Record<number, 'photo' | 'absent' | 'skip'>;
   /** Reprise d'une photo refusée sur un élément déjà fini */
   retake?: boolean;
 }
 
-/** Contrôle de la dernière photo d'étape prise à la main */
-interface StepCheck {
-  key: string;
-  label: string;
-  status: 'checking' | 'ok' | 'refused';
-  problem?: string;
-}
+type CheckStatus = 'checking' | 'ok' | 'refused';
 
 /** Photo refusée alors que l'élément est déjà fini : proposition de la reprendre */
 interface RetakeOffer {
@@ -191,7 +200,7 @@ const fmtSeconds = (ms?: number) => (ms === undefined ? '' : `${(ms / 1000).toFi
 const sameText = (a?: string, b?: string) => !!a && !!b && normText(a) === normText(b);
 
 export const GuidedVisit: React.FC<Props> = ({
-  schema, items, queue, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
+  schema, items, queue, captureResults, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
 }) => {
   // ---------------------------------------------------------------- état affiché
   const [phase, setPhase] = useState<'setup' | 'running' | 'summary'>('setup');
@@ -232,7 +241,12 @@ export const GuidedVisit: React.FC<Props> = ({
   const [spokenSent, setSpokenSent] = useState(false);
   const [autoCapture, setAutoCapture] = useState(readAutoCapture);
   const [ready, setReady] = useState(false);
-  const [stepCheck, setStepCheck] = useState<StepCheck | null>(null);
+  const [checks, setChecks] = useState<Record<string, CheckStatus>>({});
+  const [refusedCaptures, setRefusedCaptures] = useState<string[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [sheetPointId, setSheetPointId] = useState<string | null>(null);
+  const [spokenVisible, setSpokenVisible] = useState(false);
+  const spokenTimerRef = useRef<number | undefined>(undefined);
   const [retakeOffer, setRetakeOffer] = useState<RetakeOffer | null>(null);
 
   // ---------------------------------------------------------------- références (lues par les boucles)
@@ -262,6 +276,7 @@ export const GuidedVisit: React.FC<Props> = ({
   visitRef.current = { mode, theme, stageIdx, currentSpace, spaces };
   const pausedRef = useRef(paused);
   pausedRef.current = paused || showSetup || !!blockMsg;
+  // (les fiches et listes ouvertes ne mettent pas la visite en pause : la caméra continue de repérer)
   const netModeRef = useRef(netMode);
   netModeRef.current = netMode;
   const instructionRef = useRef<InstructionState | null>(null);
@@ -279,6 +294,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const pinsLayerRef = useRef<HTMLDivElement>(null);
   const pinElsRef = useRef(new Map<string, HTMLDivElement>());
   const onPinTapRef = useRef<(id: string) => void>(() => undefined);
+  const chipsRef = useRef<HTMLDivElement>(null);
   const roomsRef = useRef(new Map<string, RoomState>());
 
   const prevSmallRef = useRef<Uint8ClampedArray | null>(null);
@@ -471,6 +487,10 @@ export const GuidedVisit: React.FC<Props> = ({
           speechSinceCaptureRef.current = `${speechSinceCaptureRef.current} ${t}`.trim();
           setLastSpoken(t);
           setSpokenSent(false);
+          // Ce qui vient d'être dit s'affiche quelques secondes, puis s'efface
+          setSpokenVisible(true);
+          window.clearTimeout(spokenTimerRef.current);
+          spokenTimerRef.current = window.setTimeout(() => setSpokenVisible(false), 4500);
         } else {
           partial += `${t} `;
         }
@@ -511,6 +531,12 @@ export const GuidedVisit: React.FC<Props> = ({
       /* ignore */
     }
   }, []);
+
+  useEffect(() => {
+    if (!micMsg) return;
+    const t = window.setTimeout(() => setMicMsg(''), 8000);
+    return () => window.clearTimeout(t);
+  }, [micMsg]);
 
   useEffect(() => {
     if (phase === 'running' && cameraState === 'ready' && micOn && !paused) startSpeech();
@@ -697,10 +723,9 @@ export const GuidedVisit: React.FC<Props> = ({
     pt.status = 'active';
     const a: ActiveElement = {
       protocol, title: pt.label || protocol.title, category: pt.category, element: pt.element, stepIdx: 0, photos: 0, pointId: pt.id,
-      runId: newId(), resolved: [],
+      runId: newId(), resolved: [], outcomes: {},
     };
     setActiveNow(a);
-    setStepCheck(null); // un refus tardif de l'élément précédent passe par le bandeau « Reprendre »
     pendingCaptureRef.current = null;
     setPendingCapture(false);
     setReady(false);
@@ -709,7 +734,7 @@ export const GuidedVisit: React.FC<Props> = ({
     lastSentAtRef.current = 0;
     setInstruction({
       text: protocol.steps[0].instruction,
-      detail: pt.dir ? 'Suivez le repère jaune' : '',
+      detail: '',
       target: stepTarget(a),
       quality: 'ok',
       key: Date.now(),
@@ -776,10 +801,10 @@ export const GuidedVisit: React.FC<Props> = ({
     const resolved = a.resolved.includes(a.stepIdx) ? a.resolved : [...a.resolved, a.stepIdx];
     const next = nextUnresolved(a.protocol.steps.length, a.stepIdx, resolved);
     if (next < 0) {
-      finishElement({ ...a, resolved }, photos);
+      finishElement({ ...a, resolved, outcomes: { ...a.outcomes, [a.stepIdx]: reason } }, photos);
       return;
     }
-    const na: ActiveElement = { ...a, stepIdx: next, photos, resolved };
+    const na: ActiveElement = { ...a, stepIdx: next, photos, resolved, outcomes: { ...a.outcomes, [a.stepIdx]: reason } };
     setActiveNow(na);
     // Le repère reste sur l'élément ; l'IA le recale sur le sujet de la nouvelle étape
     const pt = findPoint(a.pointId);
@@ -797,7 +822,9 @@ export const GuidedVisit: React.FC<Props> = ({
 
   /** Retour sur une étape dont la photo a été refusée, dans l'élément en cours ou dans un élément déjà fini (reprise). */
   const goToStep = (a: ActiveElement, stepIdx: number, check: PhotoCheck) => {
-    const na: ActiveElement = { ...a, stepIdx, resolved: a.resolved.filter(i => i !== stepIdx) };
+    const outcomes = { ...a.outcomes };
+    delete outcomes[stepIdx];
+    const na: ActiveElement = { ...a, stepIdx, resolved: a.resolved.filter(i => i !== stepIdx), outcomes };
     setActiveNow(na);
     pendingCaptureRef.current = null;
     setPendingCapture(false);
@@ -806,10 +833,11 @@ export const GuidedVisit: React.FC<Props> = ({
     if (pt) pt.status = 'active';
     trackerRef.current.setKnown(stepTarget(na), pt?.dir ?? null, pt && (pt.dir || Date.now() - pt.seenAt < RECENT_BOX_MS) ? pt.box : null);
     lastSentAtRef.current = 0;
-    setStepCheck({ key: `${na.runId}:${stepIdx}`, label: na.protocol.steps[stepIdx].label, status: 'refused', problem: check.problem });
+    setChecks(c => ({ ...c, [`${na.runId}:${stepIdx}`]: 'refused' }));
+    const advice = check.advice || `Reprenez : ${na.protocol.steps[stepIdx].label.toLowerCase()}`;
     setInstruction({
-      text: check.advice || `Reprenez : ${na.protocol.steps[stepIdx].label.toLowerCase()}`,
-      detail: '',
+      text: check.problem ? `${check.problem.charAt(0).toUpperCase()}${check.problem.slice(1)} : ${advice.charAt(0).toLowerCase()}${advice.slice(1)}` : advice,
+      detail: 'Photo refusée',
       target: stepTarget(na),
       quality: 'ok',
       key: Date.now(),
@@ -825,8 +853,8 @@ export const GuidedVisit: React.FC<Props> = ({
     }
     const current = activeRef.current;
     if (current && current.runId === a.runId) {
-      // Toujours sur cet élément : on revient tout de suite sur l'étape refusée
-      goToStep(current, stepIdx, check);
+      // Toujours sur cet élément : on revient tout de suite sur l'étape refusée (la photo refusée ne compte pas)
+      goToStep({ ...current, photos: Math.max(0, current.photos - 1) }, stepIdx, check);
       return;
     }
     // Élément déjà fini : on propose de reprendre, sans interrompre l'élément en cours
@@ -851,19 +879,22 @@ export const GuidedVisit: React.FC<Props> = ({
   };
 
   /** Contrôle rapide de la photo d'étape prise à la main ; l'inspecteur continue pendant ce temps. */
-  const verifyStepPhoto = useCallback((image: string, a: ActiveElement, stepIdx: number) => {
+  const verifyStepPhoto = useCallback((image: string, a: ActiveElement, stepIdx: number, captureId: string) => {
     if (netModeRef.current === 'offline' || propsRef.current.isOffline) return;
     const step = a.protocol.steps[stepIdx];
     const key = `${a.runId}:${stepIdx}`;
-    setStepCheck({ key, label: step.label, status: 'checking' });
+    setChecks(c => ({ ...c, [key]: 'checking' }));
     checkStepPhoto(image, { element: a.title, step: step.label, aim: step.aim, optional: step.optional })
       .then(({ check }) => {
-        setStepCheck(c => (c && c.key === key ? { ...c, status: check.ok ? 'ok' : 'refused', problem: check.problem } : c));
-        if (!check.ok) onCheckFailedRef.current(a, stepIdx, check);
+        setChecks(c => ({ ...c, [key]: check.ok ? 'ok' : 'refused' }));
+        if (!check.ok) {
+          setRefusedCaptures(r => [...r, captureId]);
+          onCheckFailedRef.current(a, stepIdx, check);
+        }
       })
       .catch(() => {
         // Contrôle impossible (réseau…) : la photo est gardée, on ne bloque pas
-        setStepCheck(c => (c && c.key === key ? null : c));
+        setChecks(c => ({ ...c, [key]: 'ok' }));
       });
   }, []);
 
@@ -879,15 +910,33 @@ export const GuidedVisit: React.FC<Props> = ({
     const pt = pointsRef.current.find(q => q.id === id);
     if (!pt || pt.status === 'active') return;
     if (pt.status === 'done' && !allowDone) {
-      showToast(`${pt.label} : déjà relevé ✓`);
+      setSheetPointId(pt.id);
       return;
     }
     leavingRef.current = null;
     releaseActive('todo');
     startPoint(pt);
     setRoomListOpen(false);
+    setSheetPointId(null);
   };
   onPinTapRef.current = id => choosePoint(id, false);
+
+  /** L'inspecteur choisit lui-même l'étape (puce de la liste des photos à prendre). */
+  const jumpToStep = (idx: number) => {
+    const a = activeRef.current;
+    if (!a || idx === a.stepIdx) return;
+    const outcomes = { ...a.outcomes };
+    delete outcomes[idx];
+    const na: ActiveElement = { ...a, stepIdx: idx, resolved: a.resolved.filter(i => i !== idx), outcomes };
+    setActiveNow(na);
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    setReady(false);
+    const pt = findPoint(a.pointId);
+    trackerRef.current.setKnown(stepTarget(na), pt?.dir ?? null, pt && (pt.dir || Date.now() - pt.seenAt < RECENT_BOX_MS) ? pt.box : null);
+    lastSentAtRef.current = 0;
+    setInstruction({ text: na.protocol.steps[idx].instruction, detail: '', target: stepTarget(na), quality: 'ok', key: Date.now() });
+  };
 
   // ---------------------------------------------------------------- photo haute définition
   const doCapture = useCallback(async (requested: string, origin: 'ai' | 'manuel' | 'auto') => {
@@ -919,7 +968,13 @@ export const GuidedVisit: React.FC<Props> = ({
       lastCaptureAtRef.current = now;
       lastCaptureSmallRef.current = smallGray(video);
       if (target) targetTimesRef.current.set(target, now);
-      setCaptures(prev => [...prev, { id, target, thumb, at: now }]);
+      setCaptures(prev => [
+        ...prev,
+        {
+          id, target, thumb, at: now,
+          pointId: stepAtCapture?.pointId, title: stepAtCapture?.title, stepLabel: step?.label,
+        },
+      ]);
       setSpaces(prev => (prev.length ? [...prev.slice(0, -1), { ...prev[prev.length - 1], photos: prev[prev.length - 1].photos + 1 }] : prev));
       if (target && sameText(target, trackerRef.current.currentLabel)) trackerRef.current.clear();
       setFlashKey(k => k + 1);
@@ -929,7 +984,7 @@ export const GuidedVisit: React.FC<Props> = ({
         /* pas de vibreur */
       }
       if (stepAtCapture && activeRef.current && activeRef.current.runId === stepAtCapture.runId && activeRef.current.stepIdx === stepAtCapture.stepIdx) {
-        if (origin === 'manuel') verifyStepPhoto(hd, stepAtCapture, stepAtCapture.stepIdx);
+        if (origin === 'manuel') verifyStepPhoto(hd, stepAtCapture, stepAtCapture.stepIdx, id);
         advanceStep('photo');
       } else {
         showToast(origin === 'auto' ? 'Photo enregistrée (hors réseau)' : `Photo prise${requested ? ` : ${requested}` : ''}`);
@@ -1423,6 +1478,13 @@ export const GuidedVisit: React.FC<Props> = ({
     };
   }, [phase, cameraState]);
 
+  // La photo à prendre reste visible dans la liste des étapes
+  useEffect(() => {
+    const cur = chipsRef.current?.querySelector('[data-state="current"], [data-state="refused"]') as HTMLElement | null;
+    const box = chipsRef.current;
+    if (cur && box) box.scrollTo({ left: Math.max(0, cur.offsetLeft - box.clientWidth / 2 + cur.clientWidth / 2), behavior: 'smooth' });
+  }, [active?.runId, active?.stepIdx]);
+
   // ---------------------------------------------------------------- crédits par minute de guidage
   const chargeMinute = useCallback(async () => {
     if (propsRef.current.userCoins < AI_COSTS.GUIDED_MINUTE) {
@@ -1707,6 +1769,120 @@ export const GuidedVisit: React.FC<Props> = ({
 
   // ---------------------------------------------------------------- rendu : caméra
   const LightIcon = light === 'torch' ? Flashlight : light === 'boost' ? SunMedium : FlashlightOff;
+  const step = active ? active.protocol.steps[active.stepIdx] : null;
+  const lastCapture = captures.length ? captures[captures.length - 1] : null;
+
+  // Une seule ligne de message à la fois, la plus importante
+  type Msg = { tone: string; icon?: React.ReactNode; text: React.ReactNode; action?: React.ReactNode; testid: string };
+  const msg: Msg | null = retakeOffer
+    ? {
+        tone: 'bg-rose-600/95 text-white',
+        icon: <AlertTriangle size={16} />,
+        text: `${retakeOffer.element.title} · ${retakeOffer.element.protocol.steps[retakeOffer.stepIdx].label} : ${retakeOffer.check.problem || 'photo inexploitable'}`,
+        action: (
+          <>
+            <button onClick={acceptRetake} className="shrink-0 px-2.5 py-1 rounded-full bg-white text-rose-700 text-xs font-bold" data-testid="retake-accept">
+              Reprendre
+            </button>
+            <button onClick={() => setRetakeOffer(null)} className="shrink-0 p-1 rounded-full bg-white/15" aria-label="Ignorer">
+              <X size={14} />
+            </button>
+          </>
+        ),
+        testid: 'retake-offer',
+      }
+    : pendingCapture
+      ? { tone: 'bg-white text-black', icon: <Hand size={16} />, text: 'Ne bougez plus…', testid: 'pending-capture' }
+      : offline
+        ? {
+            tone: 'bg-amber-400 text-black',
+            icon: <WifiOff size={16} />,
+            text: autoCapture ? 'Hors réseau : photos prises seules, analysées au retour du réseau' : 'Hors réseau : vos photos seront analysées au retour du réseau',
+            testid: 'offline-banner',
+          }
+        : toast
+          ? { tone: 'bg-emerald-500 text-black', icon: <CheckCircle2 size={16} />, text: toast, testid: 'guided-toast' }
+          : interim || (spokenVisible && lastSpoken)
+            ? {
+                tone: 'bg-black/70 text-white',
+                icon: <Mic size={15} className="text-rose-300" />,
+                text: <span className="italic">« {interim || lastSpoken} »</span>,
+                action: !interim ? (
+                  <span className={`shrink-0 text-xs font-semibold ${spokenSent ? 'text-emerald-300' : 'text-white/60'}`}>{spokenSent ? 'transmis ✓' : 'envoi…'}</span>
+                ) : undefined,
+                testid: 'mic-status',
+              }
+            : spaceDone && !active
+              ? { tone: 'bg-blue-600 text-white', icon: <DoorOpen size={16} />, text: `Ensuite : ${spaceDone}`, testid: 'space-done' }
+            : speechHint
+              ? {
+                  tone: 'bg-black/70 text-white',
+                  icon: micOn ? <Mic size={15} className="text-rose-300" /> : <MicOff size={15} />,
+                  text: micOn
+                    ? 'Parlez pour préciser : « fenêtre de 1985 », « pas de store ici »…'
+                    : speechSupported ? 'Dictée coupée : touchez le micro pour parler à l’IA' : 'Dictée vocale non disponible sur ce navigateur',
+                  testid: 'speech-hint',
+                }
+              : micMsg
+                ? { tone: 'bg-amber-400 text-black', icon: <MicOff size={15} />, text: micMsg, testid: 'mic-message' }
+                : localHint === 'sombre'
+                    ? { tone: 'bg-amber-400 text-black', icon: <Sun size={16} />, text: 'Image sombre : touchez la lampe en haut', testid: 'dark-hint' }
+                    : localHint === 'mouvement'
+                      ? { tone: 'bg-black/70 text-white', text: 'Ralentissez pour que l’IA voie bien', testid: 'motion-hint' }
+                      : null;
+
+  // État de chaque photo à prendre (puces du panneau du bas)
+  const chipState = (i: number): 'current' | 'refused' | 'checking' | 'done' | 'skipped' | 'todo' => {
+    if (!active) return 'todo';
+    const chk = checks[`${active.runId}:${i}`];
+    if (i === active.stepIdx) return chk === 'refused' ? 'refused' : 'current';
+    const outcome = active.outcomes[i];
+    if (outcome === 'photo') return chk === 'checking' ? 'checking' : 'done';
+    if (outcome === 'absent' || outcome === 'skip') return 'skipped';
+    return 'todo';
+  };
+  const CHIP_CLASS: Record<ReturnType<typeof chipState>, string> = {
+    current: 'bg-amber-300 text-slate-900',
+    refused: 'bg-rose-500 text-white',
+    checking: 'bg-white/20 text-white',
+    done: 'bg-emerald-500/30 text-emerald-100',
+    skipped: 'bg-white/5 text-white/40 line-through',
+    todo: 'bg-white/10 text-white/85',
+  };
+
+  // Fiche d'un élément (repère vert, liste de la pièce, dernière photo)
+  const ALL_PHOTOS = '__all__';
+  const sheetPoint = sheetPointId && sheetPointId !== ALL_PHOTOS ? (roomPoints.find(p => p.id === sheetPointId) ?? findPoint(sheetPointId)) : null;
+  const sheetCaptures = sheetPointId === ALL_PHOTOS ? captures : sheetPoint ? captures.filter(c => c.pointId === sheetPoint.id) : [];
+  const sheetInfo = (() => {
+    const attrs = new Map<string, string>();
+    const comments: string[] = [];
+    const scores: number[] = [];
+    for (const c of sheetCaptures) {
+      if (refusedCaptures.includes(c.id)) continue; // photo refusée : pas prise en compte ici
+      const analysis = captureResults[c.id];
+      if (!analysis) continue;
+      const res = analysis.results[analysis.primary] ?? analysis.results[0];
+      if (!res) continue;
+      Object.entries(res.attributes ?? {}).forEach(([k, v]) => {
+        if (v && String(v).trim() && v !== 'Non défini') attrs.set(k, String(v));
+      });
+      if (res.commentaire && !comments.includes(res.commentaire)) comments.push(res.commentaire);
+      if (typeof res.conditionScore === 'number') scores.push(res.conditionScore);
+    }
+    const pending = sheetCaptures.filter(c => !captureResults[c.id] && captureStatus(c.id) !== 'erreur' && captureStatus(c.id) !== 'fait').length;
+    const failed = sheetCaptures.filter(c => captureStatus(c.id) === 'erreur').length;
+    const score = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+    return { attrs: Array.from(attrs.entries()), comments, score, pending, failed };
+  })();
+  const openLastPhoto = () => {
+    if (!lastCapture) {
+      setRoomListOpen(true);
+      return;
+    }
+    setSheetPointId(lastCapture.pointId && findPoint(lastCapture.pointId) ? lastCapture.pointId : ALL_PHOTOS);
+  };
+
   return (
     <div ref={containerRef} className="fixed inset-0 z-[300] bg-black text-white overflow-hidden select-none" data-testid="guided-visit">
       <video
@@ -1722,7 +1898,7 @@ export const GuidedVisit: React.FC<Props> = ({
       {/* Repères des éléments repérés dans la pièce (positionnés image par image) */}
       <div ref={pinsLayerRef} className="ar-pins" data-testid="ar-pins" />
 
-      {/* Repère sur l'élément visé (positionné image par image) */}
+      {/* Repère sur l'élément en cours (positionné image par image) */}
       <div ref={boxRef} className="ar-pin" style={{ display: 'none' }} data-testid="ar-pin">
         <span ref={boxLabelRef} className="ar-pin-label" />
         <span className="ar-pin-head"><MapPin size={16} strokeWidth={2.5} /></span>
@@ -1733,19 +1909,24 @@ export const GuidedVisit: React.FC<Props> = ({
         <span ref={arrowLabelRef} className="ar-arrow-label" />
       </div>
 
-      {/* Haut : fermer, mode, lampe, micro */}
-      <div className="absolute top-0 inset-x-0 z-10 bg-gradient-to-b from-black/80 via-black/40 to-transparent px-3 pb-6 safe-top">
-        <div className="flex items-center gap-2">
-          <button onClick={finishVisit} className="p-2.5 rounded-full bg-black/40 hover:bg-black/60" aria-label="Terminer la visite">
-            <X size={22} />
+      {/* Haut : une seule ligne */}
+      <div className="absolute top-0 inset-x-0 z-10 bg-gradient-to-b from-black/55 to-transparent px-3 pb-5 safe-top">
+        <div className="flex items-center gap-2 pt-1">
+          <button onClick={finishVisit} className="p-2.5 rounded-full bg-black/40" aria-label="Terminer la visite">
+            <X size={20} />
           </button>
           <button
-            onClick={() => setShowSetup(true)}
-            className="flex-1 min-w-0 flex items-center gap-1.5 px-3 py-2 rounded-full bg-black/40 hover:bg-black/60 text-sm font-semibold"
+            onClick={() => setRoomListOpen(true)}
+            className="flex-1 min-w-0 flex items-center gap-1.5 px-3 py-2 rounded-full bg-black/40 text-sm font-semibold text-left"
+            data-testid="space-chip"
           >
-            {mode === 'parcours' ? <Route size={16} className="shrink-0 text-emerald-300" /> : <MapPin size={16} className="shrink-0 text-blue-300" />}
-            <span className="truncate">{mode === 'parcours' ? 'Parcours guidé' : 'Visite libre'} · {theme === ALL_ZONES ? 'Tout' : theme}</span>
-            <ChevronDown size={16} className="shrink-0 opacity-70" />
+            <MapPin size={15} className="shrink-0 text-blue-300" />
+            <span className="truncate">{offline ? 'Hors réseau' : currentSpace || 'Pièce en cours d’identification'}</span>
+            {roomPoints.length > 0 && (
+              <span className="shrink-0 flex items-center gap-1 text-emerald-300" data-testid="room-count">
+                · <ListChecks size={13} /> {roomDone}/{roomPoints.length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => void toggleLight()}
@@ -1763,171 +1944,35 @@ export const GuidedVisit: React.FC<Props> = ({
                 if (!micOn) flashSpeechHint();
                 setMicOn(m => !m);
               }}
-              className={`p-2.5 rounded-full ${micOn ? 'bg-rose-500 ring-2 ring-rose-300/60' : 'bg-black/40'}`}
+              className={`relative p-2.5 rounded-full ${micOn ? 'bg-rose-500' : 'bg-black/40'}`}
               aria-label={micOn ? 'Couper la dictée' : 'Activer la dictée'}
               data-testid="mic-toggle"
             >
+              {micOn && !paused && <span className="absolute inset-0 rounded-full listen-ring" />}
               {micOn ? <Mic size={20} /> : <MicOff size={20} />}
             </button>
           )}
+          <button onClick={() => setMenuOpen(true)} className="p-2.5 rounded-full bg-black/40" aria-label="Menu de la visite" data-testid="menu-button">
+            <MoreHorizontal size={20} />
+          </button>
         </div>
-
-        {/* Progression */}
-        <div className="mt-3 px-1">
-          <div className="flex justify-between text-[11px] font-medium text-white/80 mb-1">
-            <span>{checklist.done}/{checklist.total} éléments complets</span>
-            <span className="flex items-center gap-1.5">
-              {demoMode && <span className="px-1.5 py-0.5 rounded bg-purple-500/80 text-white">IA simulée</span>}
-              {!demoMode && lastMeta && <span>{modelLabel(lastMeta.model)} · {fmtSeconds(lastMeta.latencyMs)}</span>}
-            </span>
-          </div>
-          <div className="h-1.5 rounded-full bg-white/20 overflow-hidden">
-            <div className="h-full bg-emerald-400 transition-all duration-500" style={{ width: `${progressPct}%` }} />
-          </div>
-          {mode === 'parcours' && (
-            <div className="mt-2 flex items-center gap-2 text-xs" data-testid="stage-line">
-              <span className="px-2 py-0.5 rounded-full bg-emerald-500/25 text-emerald-200 font-semibold shrink-0">
-                Étape {stageIdx + 1}/{PARCOURS_STAGES.length}
-              </span>
-              <span className="truncate text-white/85">{PARCOURS_STAGES[stageIdx].label}</span>
-              {stageIdx < PARCOURS_STAGES.length - 1 && (
-                <button onClick={nextStage} className="ml-auto shrink-0 flex items-center gap-0.5 px-2 py-0.5 rounded-full bg-white/15 font-semibold">
-                  Étape suivante <ChevronRight size={14} />
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-
-        {offline && (
-          <div className="mt-3 flex items-start gap-2 rounded-xl bg-amber-500/90 text-black px-3 py-2 text-sm font-semibold" data-testid="offline-banner">
-            <WifiOff size={18} className="shrink-0 mt-0.5" />
-            <span>
-              {autoCapture
-                ? 'Hors réseau : chaque nouvelle scène stable est photographiée et sera analysée au retour du réseau.'
-                : 'Hors réseau : prenez les photos, elles seront analysées au retour du réseau.'}
-            </span>
-          </div>
-        )}
-
-        {/* Consigne */}
-        {!offline && (
-          <div className="mt-3" aria-live="polite">
-            {askingNext ? (
-              <div className="rounded-2xl bg-black/60 backdrop-blur-md px-4 py-3 flex items-center gap-3">
-                <Loader2 size={20} className="animate-spin text-blue-300" />
-                <p className="text-lg font-semibold">Je regarde où aller ensuite…</p>
-              </div>
-            ) : instruction ? (
-              <div className="rounded-2xl bg-black/60 backdrop-blur-md border border-white/10 px-4 py-3 shadow-2xl" data-testid="guide-instruction">
-                {active && (
-                  <div className="mb-2" data-testid="step-bar">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-amber-200">
-                      <ListChecks size={14} className="shrink-0" />
-                      <span className="truncate">
-                        {active.title} · étape {active.stepIdx + 1}/{active.protocol.steps.length} — {active.protocol.steps[active.stepIdx].label}
-                      </span>
-                    </div>
-                    <div className="mt-1.5 flex gap-1">
-                      {active.protocol.steps.map((st, i) => (
-                        <span
-                          key={st.key}
-                          className={`h-1.5 flex-1 rounded-full ${i === active.stepIdx ? 'bg-amber-300' : active.resolved.includes(i) ? 'bg-emerald-400' : 'bg-white/20'}`}
-                        />
-                      ))}
-                    </div>
-                    {stepCheck && (
-                      <p
-                        className={`mt-1.5 text-xs font-semibold flex items-center gap-1.5 ${stepCheck.status === 'ok' ? 'text-emerald-300' : stepCheck.status === 'refused' ? 'text-rose-300' : 'text-white/70'}`}
-                        data-testid="photo-check"
-                        data-status={stepCheck.status}
-                      >
-                        {stepCheck.status === 'checking' && <Loader2 size={12} className="animate-spin shrink-0" />}
-                        {stepCheck.status === 'ok' && <CheckCircle2 size={12} className="shrink-0" />}
-                        {stepCheck.status === 'refused' && <AlertTriangle size={12} className="shrink-0" />}
-                        <span className="truncate">
-                          Photo « {stepCheck.label} » :{' '}
-                          {stepCheck.status === 'checking' ? 'vérification…' : stepCheck.status === 'ok' ? 'validée' : `refusée${stepCheck.problem ? ` (${stepCheck.problem})` : ''}`}
-                        </span>
-                      </p>
-                    )}
-                  </div>
-                )}
-                <div key={instruction.text} className="guide-pop flex items-start gap-3">
-                  <QualityIcon size={22} className="text-blue-300 shrink-0 mt-1" />
-                  <div className="min-w-0">
-                    <p className="text-[22px] leading-tight font-bold">{instruction.text}</p>
-                    {instruction.detail && <p className="mt-1 text-sm text-white/75">{instruction.detail}</p>}
-                  </div>
-                </div>
-                {seenNow.length > 0 && !active && (
-                  <p className="mt-2 text-xs text-emerald-200/90 truncate">Vu : {seenNow.join(' · ')}</p>
-                )}
-                {active && (
-                  <div className="mt-3 flex gap-2">
-                    <button
-                      onClick={() => advanceStep('skip')}
-                      className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-white/15 text-xs font-bold"
-                      data-testid="skip-step"
-                    >
-                      <SkipForward size={14} /> Passer l'étape
-                    </button>
-                    <button onClick={abandonElement} className="px-3 py-1.5 rounded-full bg-white/10 text-xs font-semibold text-white/80" data-testid="next-element">
-                      Autre élément
-                    </button>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="rounded-2xl bg-black/50 backdrop-blur-md px-4 py-3 flex items-center gap-3">
-                <Loader2 size={20} className="animate-spin text-blue-300" />
-                <p className="text-lg font-semibold">
-                  {cameraState !== 'ready'
-                    ? 'Ouverture de la caméra…'
-                    : doneElements.length
-                      ? 'Je cherche l’élément suivant…'
-                      : mode === 'parcours'
-                        ? 'Je prépare le parcours…'
-                        : 'Je regarde où vous êtes…'}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
       </div>
 
-      {/* Milieu : indications locales */}
-      <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 z-10 flex flex-col items-center gap-2 pointer-events-none px-6">
-        {ready && !pendingCapture && !autoCapture && (
-          <div className="px-4 py-2 rounded-full bg-emerald-500 text-black font-bold text-base flex items-center gap-2 shadow-xl" data-testid="ready-cue">
-            <CheckCircle2 size={18} /> Bien cadré : prenez la photo
-          </div>
-        )}
-        {pendingCapture && (
-          <div className="px-4 py-2 rounded-full bg-white text-black font-bold text-base flex items-center gap-2 shadow-xl">
-            <Hand size={18} /> Ne bougez plus…
-          </div>
-        )}
-        {!pendingCapture && localHint === 'mouvement' && !offline && (
-          <div className="px-4 py-2 rounded-full bg-black/60 text-white font-semibold text-sm">Ralentissez pour que l'IA voie bien</div>
-        )}
-        {localHint === 'sombre' && (
-          <div className="px-4 py-2 rounded-full bg-amber-400 text-black font-semibold text-sm flex items-center gap-2">
-            <Sun size={16} /> Image sombre : touchez la lampe en haut
-          </div>
-        )}
-        {(paused || blockMsg) && (
-          <div className="px-5 py-3 rounded-2xl bg-black/75 text-center max-w-sm pointer-events-auto">
+      {/* Milieu : seulement la pause ou un blocage */}
+      {(paused || blockMsg) && (
+        <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 z-10 flex justify-center px-6">
+          <div className="px-5 py-3 rounded-2xl bg-black/75 text-center max-w-sm">
             <p className="font-bold">{blockMsg ? 'Guidage interrompu' : 'Visite en pause'}</p>
             {blockMsg && <p className="text-sm text-white/80 mt-1">{blockMsg}</p>}
-            {blockMsg && (
-              <button onClick={() => setBlockMsg('')} className="mt-3 px-4 py-2 rounded-full bg-white/15 text-sm font-semibold">
-                Réessayer
-              </button>
-            )}
+            <button
+              onClick={() => (blockMsg ? setBlockMsg('') : setPaused(false))}
+              className="mt-3 px-4 py-2 rounded-full bg-white/15 text-sm font-semibold"
+            >
+              {blockMsg ? 'Réessayer' : 'Reprendre'}
+            </button>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {cameraState === 'error' && (
         <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-black/85">
@@ -1942,148 +1987,309 @@ export const GuidedVisit: React.FC<Props> = ({
         </div>
       )}
 
-      {/* Bas : dictée, espace, photos, commandes */}
-      <div className="absolute bottom-0 inset-x-0 z-10 bg-gradient-to-t from-black/85 via-black/50 to-transparent pt-10 safe-bottom">
-        {speechHint && !offline && (
-          <div className="mx-4 mb-2 rounded-xl bg-rose-600/90 px-3 py-2 guide-pop" data-testid="speech-hint">
-            {micOn ? (
-              <>
-                <p className="text-sm font-bold flex items-center gap-1.5"><Mic size={15} className="shrink-0" /> Vous pouvez parler pendant la visite</p>
-                <p className="text-xs text-white/90 mt-0.5">
-                  « fenêtre de 1985 », « parquet chêne massif », « pas de store ici »… Vos précisions guident l'IA et sont jointes aux photos.
-                </p>
-              </>
-            ) : (
-              <p className="text-sm font-semibold flex items-center gap-1.5">
-                <MicOff size={15} className="shrink-0" />
-                {speechSupported ? 'Dictée coupée : touchez le micro en haut pour parler à l’IA.' : 'Dictée vocale non disponible sur ce navigateur.'}
-              </p>
-            )}
-          </div>
-        )}
-        {micMsg ? (
-          <p className="px-4 mb-2 text-sm text-amber-200 truncate">{micMsg}</p>
-        ) : micOn && !paused ? (
-          <div className="px-4 mb-2 flex items-center gap-2 text-sm min-w-0" data-testid="mic-status">
-            <span className="listen-dot shrink-0" />
-            <span className="font-semibold text-rose-200 shrink-0">À l'écoute</span>
-            <span className="truncate italic text-white/85">
-              {interim ? `« ${interim} »` : lastSpoken ? `« ${lastSpoken} »` : 'parlez pour préciser'}
-            </span>
-            {!interim && lastSpoken && (
-              <span className={`shrink-0 text-xs font-semibold ${spokenSent ? 'text-emerald-300' : 'text-white/60'}`}>
-                {spokenSent ? 'transmis ✓' : 'envoi…'}
-              </span>
-            )}
-          </div>
-        ) : null}
-        {toast && (
-          <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-emerald-500/90 text-black text-sm font-semibold truncate" data-testid="guided-toast">{toast}</div>
-        )}
-        {retakeOffer && (
-          <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-rose-600/95 text-white text-sm flex items-center gap-2" data-testid="retake-offer">
-            <AlertTriangle size={16} className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate font-semibold">
-              {retakeOffer.element.title} · {retakeOffer.element.protocol.steps[retakeOffer.stepIdx].label} : {retakeOffer.check.problem || 'photo inexploitable'}
-            </span>
-            <button onClick={acceptRetake} className="shrink-0 px-2.5 py-1 rounded-full bg-white text-rose-700 text-xs font-bold" data-testid="retake-accept">
-              Reprendre
-            </button>
-            <button onClick={() => setRetakeOffer(null)} className="shrink-0 p-1 rounded-full bg-white/15" aria-label="Ignorer">
-              <X size={14} />
-            </button>
-          </div>
-        )}
-        {spaceDone && !offline && (
-          <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-blue-600/90 text-white text-sm font-semibold flex items-center gap-2" data-testid="space-done">
-            <DoorOpen size={16} className="shrink-0" />
-            <span className="truncate">Ensuite : {spaceDone}</span>
+      {/* Bas : message, consigne, déclencheur */}
+      <div className="absolute bottom-0 inset-x-0 z-10 bg-gradient-to-t from-black/70 via-black/30 to-transparent pt-8 safe-bottom">
+        {msg && (
+          <div className={`mx-3 mb-2 px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-lg ${msg.tone}`} data-testid={msg.testid}>
+            {msg.icon && <span className="shrink-0">{msg.icon}</span>}
+            <span className="min-w-0 flex-1 line-clamp-2">{msg.text}</span>
+            {msg.action}
           </div>
         )}
 
-        <div className="flex items-center gap-2 px-4 mb-3">
-          <button
-            onClick={() => setRoomListOpen(true)}
-            className="min-w-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/50 text-sm font-semibold text-left"
-            data-testid="space-chip"
-          >
-            <MapPin size={14} className="shrink-0 text-blue-300" />
-            <span className="truncate">{currentSpace || 'Lieu en cours d’identification'}</span>
-            {roomPoints.length > 0 ? (
-              <span className="shrink-0 flex items-center gap-1 text-emerald-300" data-testid="room-count">
-                · <ListChecks size={13} /> {roomDone}/{roomPoints.length}
-              </span>
-            ) : currentSpace ? (
-              <span className="text-white/60 font-normal shrink-0">· {spacePhotos} photo{spacePhotos > 1 ? 's' : ''}</span>
-            ) : null}
-          </button>
-          <button
-            onClick={askNextSpace}
-            disabled={askingNext || offline || cameraState !== 'ready'}
-            className={`ml-auto shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-full text-sm font-bold ${spaceDone ? 'bg-blue-500 text-white' : 'bg-white/15 text-white'} disabled:opacity-40`}
-            data-testid="next-space"
-          >
-            Pièce suivante <ArrowRight size={15} />
-          </button>
+        <div className="mx-3 mb-3 rounded-2xl bg-black/55 backdrop-blur-md border border-white/10 px-3 py-2.5" data-testid="guide-panel" aria-live="polite">
+          {askingNext ? (
+            <div className="flex items-center gap-2.5">
+              <Loader2 size={18} className="animate-spin text-blue-300 shrink-0" />
+              <p className="text-[17px] font-semibold" data-testid="guide-instruction">Je regarde où aller ensuite…</p>
+            </div>
+          ) : active && step ? (
+            <>
+              <div
+                className="flex items-center gap-2"
+                data-testid="step-bar"
+                data-element={active.title}
+                data-index={active.stepIdx}
+                data-step={step.label}
+              >
+                <span className="min-w-0 flex-1 truncate text-sm font-bold text-amber-200">{active.title}</span>
+                <button onClick={() => advanceStep('skip')} className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-full bg-white/10 text-xs font-semibold" data-testid="skip-step">
+                  <SkipForward size={13} /> Passer
+                </button>
+                <button onClick={abandonElement} className="shrink-0 px-2 py-1 rounded-full bg-white/10 text-xs font-semibold" data-testid="next-element">
+                  Autre
+                </button>
+              </div>
+              <div ref={chipsRef} className="mt-2 flex gap-1.5 overflow-x-auto scrollbar-hide" data-testid="step-chips">
+                {active.protocol.steps.map((st, i) => {
+                  const state = chipState(i);
+                  return (
+                    <button
+                      key={st.key}
+                      onClick={() => jumpToStep(i)}
+                      className={`shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${CHIP_CLASS[state]}`}
+                      data-testid="step-chip"
+                      data-state={state}
+                    >
+                      {state === 'done' && <CheckCircle2 size={12} />}
+                      {state === 'checking' && <Loader2 size={12} className="animate-spin" />}
+                      {state === 'refused' && <AlertTriangle size={12} />}
+                      {st.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p
+                key={instruction?.key}
+                className={`mt-2 text-[17px] leading-snug font-semibold line-clamp-2 guide-pop ${ready && !autoCapture ? 'text-emerald-300' : ''}`}
+                data-testid="guide-instruction"
+              >
+                {instruction?.text ?? step.instruction}
+              </p>
+            </>
+          ) : (
+            <div className="flex items-start gap-2.5">
+              {!instruction && cameraState !== 'error' && <Loader2 size={18} className="animate-spin text-blue-300 shrink-0 mt-1" />}
+              <div className="min-w-0">
+                <p className="text-[17px] leading-snug font-semibold line-clamp-2 guide-pop" key={instruction?.key} data-testid="guide-instruction">
+                  {instruction
+                    ? instruction.text
+                    : cameraState !== 'ready'
+                      ? 'Ouverture de la caméra…'
+                      : mode === 'parcours'
+                        ? 'Je prépare le parcours…'
+                        : 'Filmez la pièce : je repère les éléments'}
+                </p>
+                {roomPoints.some(p => p.status === 'todo') && (
+                  <p className="mt-0.5 text-xs text-white/60">Touchez un repère jaune pour le relever</p>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
-        {captures.length > 0 && (
-          <div className="flex gap-2 overflow-x-auto px-4 pb-3 scrollbar-hide" data-testid="capture-strip">
-            {[...captures].reverse().map(c => {
-              const st = captureStatus(c.id);
-              return (
-                <div key={c.id} className="relative shrink-0 w-14 h-14 rounded-xl overflow-hidden border border-white/20">
-                  <img src={c.thumb} alt={c.target || 'Photo'} className="w-full h-full object-cover" />
-                  <span className="absolute bottom-0.5 right-0.5 rounded-full bg-black/70 p-0.5">
-                    {st === 'fait' && <CheckCircle2 size={13} className="text-emerald-400" />}
-                    {st === 'analyse' && <Loader2 size={13} className="animate-spin text-blue-300" />}
-                    {st === 'attente' && <Clock size={13} className="text-amber-300" />}
-                    {st === 'erreur' && <AlertTriangle size={13} className="text-red-400" />}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        <div className="flex items-center justify-between px-6">
+        <div className="flex items-center justify-between px-5 pb-2">
           <button
-            onClick={() => setPaused(p => !p)}
-            className="w-14 h-14 rounded-full bg-white/15 hover:bg-white/25 flex items-center justify-center"
-            aria-label={paused ? 'Reprendre' : 'Pause'}
+            onClick={openLastPhoto}
+            className="relative w-14 h-14 rounded-xl overflow-hidden border-2 border-white/70 bg-black/40 flex items-center justify-center"
+            aria-label="Voir ce qui a été relevé"
+            data-testid="last-photo"
           >
-            {paused ? <Play size={24} /> : <Pause size={24} />}
+            {lastCapture ? <img src={lastCapture.thumb} alt="" className="w-full h-full object-cover" /> : <Images size={22} className="text-white/70" />}
+            {captures.length > 0 && (
+              <span className="absolute top-0.5 right-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-white text-black text-[11px] font-bold flex items-center justify-center">
+                {captures.length}
+              </span>
+            )}
           </button>
 
           <button
             onClick={() => void doCapture(instruction?.target ?? '', 'manuel')}
             disabled={cameraState !== 'ready'}
-            className={`w-20 h-20 rounded-full border-4 flex items-center justify-center transition-colors ${ready && !autoCapture ? 'border-emerald-400 ring-4 ring-emerald-400/40' : 'border-white'} ${waiting && !ready ? 'pulse-ring' : ''} disabled:opacity-40`}
+            className={`w-20 h-20 rounded-full border-4 flex items-center justify-center transition-colors ${ready && !autoCapture ? 'border-emerald-400 ring-4 ring-emerald-400/40' : 'border-white'} disabled:opacity-40`}
             aria-label="Prendre une photo"
             data-testid="shutter"
           >
-            <span className="w-16 h-16 rounded-full bg-white" />
+            <span className={`w-16 h-16 rounded-full ${autoCapture ? 'bg-sky-200' : 'bg-white'}`} />
           </button>
 
-          <button onClick={finishVisit} className="h-14 px-4 rounded-full bg-white/15 hover:bg-white/25 text-sm font-bold">
-            Terminer
-          </button>
-        </div>
-        <div className="mt-2 px-4 flex items-center justify-center gap-2 text-[11px] text-white/60 min-w-0">
-          <span className="truncate">
-            {active && !autoCapture
-              ? `Photo : ${active.protocol.steps[active.stepIdx].label}`
-              : `${captures.length} photo${captures.length > 1 ? 's' : ''} · ${doneCount} analysée${doneCount > 1 ? 's' : ''}`}
-          </span>
           <button
-            onClick={() => changeAutoCapture(!autoCapture)}
-            className={`shrink-0 px-2 py-0.5 rounded-full font-semibold ${autoCapture ? 'bg-sky-400 text-black' : 'bg-white/15 text-white/80'}`}
-            data-testid="auto-toggle"
+            onClick={askNextSpace}
+            disabled={askingNext || offline || cameraState !== 'ready'}
+            className={`h-12 px-3 rounded-full flex items-center gap-1 text-xs font-bold ${spaceDone ? 'bg-blue-500' : 'bg-white/15'} disabled:opacity-40`}
+            data-testid="next-space"
           >
-            {autoCapture ? 'Mains libres' : 'Photo manuelle'}
+            <DoorOpen size={16} /> Pièce suivante
           </button>
         </div>
       </div>
+
+      {/* Menu de la visite : tout ce qui est secondaire */}
+      {menuOpen && (
+        <div className="absolute inset-0 z-30 flex flex-col justify-end bg-black/40" onClick={() => setMenuOpen(false)}>
+          <div
+            className="rounded-t-3xl bg-slate-950/95 backdrop-blur-md border-t border-white/10 px-4 pt-4 pb-4 safe-bottom max-h-[75vh] overflow-y-auto space-y-3"
+            onClick={e => e.stopPropagation()}
+            data-testid="visit-menu"
+          >
+            <div className="flex items-center justify-between">
+              <p className="font-bold text-lg">Visite</p>
+              <button onClick={() => setMenuOpen(false)} className="p-2 rounded-full bg-white/10" aria-label="Fermer le menu">
+                <X size={18} />
+              </button>
+            </div>
+
+            <button
+              onClick={() => { setMenuOpen(false); setShowSetup(true); }}
+              className="w-full flex items-center gap-3 px-3 py-3 rounded-xl bg-white/5 text-left"
+            >
+              {mode === 'parcours' ? <Route size={18} className="text-emerald-300 shrink-0" /> : <MapPin size={18} className="text-blue-300 shrink-0" />}
+              <span className="flex-1 min-w-0 truncate font-semibold">{mode === 'parcours' ? 'Parcours guidé' : 'Visite libre'} · {theme === ALL_ZONES ? 'Tout' : theme}</span>
+              <ChevronRight size={18} className="text-white/50 shrink-0" />
+            </button>
+
+            {mode === 'parcours' && (
+              <div className="flex items-center gap-2 px-3 py-3 rounded-xl bg-white/5" data-testid="stage-line">
+                <span className="px-2 py-0.5 rounded-full bg-emerald-500/25 text-emerald-200 text-xs font-semibold shrink-0">
+                  Étape {stageIdx + 1}/{PARCOURS_STAGES.length}
+                </span>
+                <span className="flex-1 min-w-0 truncate text-sm">{PARCOURS_STAGES[stageIdx].label}</span>
+                {stageIdx < PARCOURS_STAGES.length - 1 && (
+                  <button onClick={() => { setMenuOpen(false); nextStage(); }} className="shrink-0 px-2.5 py-1 rounded-full bg-white/15 text-xs font-semibold">
+                    Étape suivante
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="px-3 py-3 rounded-xl bg-white/5">
+              <p className="text-sm font-semibold mb-2 flex items-center gap-2"><Camera size={16} /> Prise de photo</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => changeAutoCapture(false)}
+                  className={`py-2 rounded-lg text-sm font-semibold ${!autoCapture ? 'bg-white text-slate-900' : 'bg-white/10'}`}
+                  data-testid="menu-capture-manual"
+                >
+                  Manuelle
+                </button>
+                <button
+                  onClick={() => changeAutoCapture(true)}
+                  className={`py-2 rounded-lg text-sm font-semibold ${autoCapture ? 'bg-white text-slate-900' : 'bg-white/10'}`}
+                  data-testid="auto-toggle"
+                >
+                  Mains libres
+                </button>
+              </div>
+            </div>
+
+            <div className="px-3 py-3 rounded-xl bg-white/5 text-sm space-y-2">
+              <div className="flex justify-between text-white/80">
+                <span>{checklist.done}/{checklist.total} éléments complets</span>
+                <span>{captures.length} photo{captures.length > 1 ? 's' : ''} · {doneCount} analysée{doneCount > 1 ? 's' : ''}</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-white/15 overflow-hidden">
+                <div className="h-full bg-emerald-400" style={{ width: `${progressPct}%` }} />
+              </div>
+              <p className="text-xs text-white/50">
+                {demoMode ? 'IA simulée (mode invité)' : lastMeta ? `${modelLabel(lastMeta.model)} · ${fmtSeconds(lastMeta.latencyMs)} par consigne` : 'IA : en attente de la première consigne'}
+                {' · '}Version {versionLabel()}
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => { setPaused(p => !p); setMenuOpen(false); }}
+                className="py-3 rounded-xl bg-white/10 font-semibold flex items-center justify-center gap-2"
+              >
+                {paused ? <Play size={18} /> : <Pause size={18} />} {paused ? 'Reprendre' : 'Pause'}
+              </button>
+              <button onClick={finishVisit} className="py-3 rounded-xl bg-rose-600 font-bold" data-testid="menu-finish">
+                Terminer la visite
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fiche d'un élément : photos et informations relevées */}
+      {sheetPointId && (
+        <div className="absolute inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={() => setSheetPointId(null)}>
+          <div
+            className="rounded-t-3xl bg-slate-950/95 backdrop-blur-md border-t border-white/10 px-4 pt-4 pb-4 safe-bottom max-h-[75vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+            data-testid="element-sheet"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="font-bold text-lg truncate">{sheetPoint ? sheetPoint.label : 'Photos de la visite'}</p>
+                {sheetPoint && (
+                  <p className="text-xs text-white/60 truncate">
+                    {!sameText(sheetPoint.element, sheetPoint.label) && `${sheetPoint.element || sheetPoint.category} · `}
+                    {sheetPoint.status === 'done' ? 'relevé ✓' : sheetPoint.status === 'active' ? 'en cours' : sheetPoint.status === 'skipped' ? 'passé' : 'à faire'}
+                  </p>
+                )}
+              </div>
+              <button onClick={() => setSheetPointId(null)} className="p-2 rounded-full bg-white/10 shrink-0" aria-label="Fermer la fiche">
+                <X size={18} />
+              </button>
+            </div>
+
+            {sheetCaptures.length > 0 ? (
+              <div className="mt-3 flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+                {sheetCaptures.map(c => {
+                  const st = captureStatus(c.id);
+                  const refused = refusedCaptures.includes(c.id);
+                  return (
+                    <div key={c.id} className={`shrink-0 w-20 ${refused ? 'opacity-60' : ''}`} data-testid="sheet-photo" data-refused={refused ? '1' : '0'}>
+                      <div className={`relative w-20 h-20 rounded-xl overflow-hidden border ${refused ? 'border-rose-400' : 'border-white/15'}`}>
+                        <img src={c.thumb} alt={c.stepLabel || c.target || 'Photo'} className="w-full h-full object-cover" />
+                        <span className="absolute bottom-0.5 right-0.5 rounded-full bg-black/70 p-0.5">
+                          {st === 'fait' && <CheckCircle2 size={13} className="text-emerald-400" />}
+                          {st === 'analyse' && <Loader2 size={13} className="animate-spin text-blue-300" />}
+                          {st === 'attente' && <Clock size={13} className="text-amber-300" />}
+                          {st === 'erreur' && <AlertTriangle size={13} className="text-red-400" />}
+                        </span>
+                      </div>
+                      <p className={`mt-1 text-[11px] truncate ${refused ? 'text-rose-300' : 'text-white/70'}`}>{refused ? 'Refusée' : c.stepLabel || c.title || 'Photo'}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="mt-3 text-sm text-white/60">Pas encore de photo de cet élément.</p>
+            )}
+
+            <div className="mt-3" data-testid="element-info">
+              <p className="text-xs uppercase tracking-wider text-white/50 mb-1.5">Informations relevées</p>
+              {sheetInfo.attrs.length > 0 || sheetInfo.score !== null ? (
+                <dl className="rounded-xl bg-white/5 divide-y divide-white/5 text-sm">
+                  {sheetInfo.attrs.map(([k, v]) => (
+                    <div key={k} className="flex justify-between gap-3 px-3 py-2">
+                      <dt className="text-white/60">{k}</dt>
+                      <dd className="font-semibold text-right">{v}</dd>
+                    </div>
+                  ))}
+                  {sheetInfo.score !== null && (
+                    <div className="flex justify-between gap-3 px-3 py-2">
+                      <dt className="text-white/60">État estimé</dt>
+                      <dd className="font-semibold">{sheetInfo.score}/100</dd>
+                    </div>
+                  )}
+                </dl>
+              ) : (
+                <p className="text-sm text-white/60">
+                  {sheetInfo.pending ? '' : sheetCaptures.length ? 'Aucune information lue sur ces photos.' : 'Rien pour l’instant.'}
+                </p>
+              )}
+              {sheetInfo.pending > 0 && (
+                <p className="mt-2 text-sm text-blue-200 flex items-center gap-2">
+                  <Loader2 size={14} className="animate-spin" /> Analyse en cours ({sheetInfo.pending} photo{sheetInfo.pending > 1 ? 's' : ''})…
+                </p>
+              )}
+              {sheetInfo.failed > 0 && (
+                <p className="mt-2 text-sm text-rose-300">{sheetInfo.failed} analyse{sheetInfo.failed > 1 ? 's' : ''} en échec (à relancer depuis l’inspection)</p>
+              )}
+              {sheetInfo.comments.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {sheetInfo.comments.map((cm, i) => (
+                    <p key={i} className="text-xs text-white/70 bg-white/5 rounded-lg px-3 py-2">{cm}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {sheetPoint && sheetPoint.status !== 'active' && (
+              <button
+                onClick={() => choosePoint(sheetPoint.id, true)}
+                className="mt-4 w-full py-3 rounded-xl bg-white/10 font-semibold"
+                data-testid="sheet-start"
+              >
+                {sheetPoint.status === 'done' ? 'Refaire cet élément' : 'Relever maintenant'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {roomListOpen && (
         <div className="absolute inset-0 z-30 flex flex-col justify-end bg-black/40" onClick={() => setRoomListOpen(false)}>
@@ -2100,7 +2306,7 @@ export const GuidedVisit: React.FC<Props> = ({
             </div>
             <p className="text-xs text-white/60 mb-3">
               {roomPoints.length
-                ? `${roomDone}/${roomPoints.length} éléments faits · touchez un élément pour le relever maintenant`
+                ? `${roomDone}/${roomPoints.length} éléments faits · touchez un élément jaune pour le relever, vert pour voir ce qui a été relevé`
                 : 'Rien de repéré pour l’instant : filmez la pièce, les repères apparaissent au fur et à mesure.'}
             </p>
             <ul className="space-y-1.5">
@@ -2109,8 +2315,14 @@ export const GuidedVisit: React.FC<Props> = ({
                 return (
                   <li key={pt.id}>
                     <button
-                      onClick={() => choosePoint(pt.id, true)}
-                      disabled={isActive}
+                      onClick={() => {
+                        if (pt.status === 'done' || isActive) {
+                          setRoomListOpen(false);
+                          setSheetPointId(pt.id);
+                        } else {
+                          choosePoint(pt.id, true);
+                        }
+                      }}
                       className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left ${isActive ? 'bg-amber-400/20 border border-amber-300/50' : 'bg-white/5 hover:bg-white/10'}`}
                       data-testid="room-item"
                       data-status={pt.status}
@@ -2125,7 +2337,7 @@ export const GuidedVisit: React.FC<Props> = ({
                         {!sameText(pt.element, pt.label) && <span className="block text-xs text-white/55 truncate">{pt.element || pt.category}</span>}
                       </span>
                       <span className="shrink-0 text-xs text-white/60">
-                        {isActive ? 'en cours' : pt.status === 'done' ? `${pt.photos} photo${pt.photos > 1 ? 's' : ''} · refaire` : pt.status === 'skipped' ? 'passé · reprendre' : 'à faire'}
+                        {isActive ? 'en cours' : pt.status === 'done' ? `${pt.photos} photo${pt.photos > 1 ? 's' : ''} · voir` : pt.status === 'skipped' ? 'passé · reprendre' : 'à faire'}
                       </span>
                     </button>
                   </li>
