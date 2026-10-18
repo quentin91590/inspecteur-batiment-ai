@@ -18,6 +18,7 @@ import {
   type ARState, type NormBox, type Vec3,
 } from '../services/arTracker';
 import type { VisibleElement } from '../services/aiTypes';
+import { versionLabel } from '../services/appVersion';
 
 // ------------------------------------------------------------------ réglages du guidage
 
@@ -1619,6 +1620,7 @@ export const GuidedVisit: React.FC<Props> = ({
             })}
           </div>
         </div>
+        <p className="pt-3 text-center text-[11px] text-white/40" data-testid="app-version">Version {versionLabel()}</p>
       </div>
     </div>
   );

@@ -6,6 +6,7 @@ import {
   benchAnalyze, estimateCostUsd, getModelPrefs, isDemoMode, listModels, setModelPrefs,
   type AiMeta, type ModelInfo, type ModelPrefs, type Purpose,
 } from '../services/aiService';
+import { versionLabel } from '../services/appVersion';
 
 interface Props {
   schema: SchemaDefinition;
@@ -110,6 +111,7 @@ export const ModelSettingsModal: React.FC<Props> = ({ schema, userCoins, onSpend
           <h2 className="flex items-center gap-2 text-lg font-bold text-slate-900">
             <BrainCircuit size={20} className="text-purple-600" /> Modèles d'IA
           </h2>
+          <span className="ml-auto mr-2 text-[11px] text-slate-400" data-testid="app-version">Version {versionLabel()}</span>
           <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-100" aria-label="Fermer">
             <X size={22} className="text-slate-500" />
           </button>
