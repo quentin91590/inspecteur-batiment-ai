@@ -128,6 +128,8 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
 - Mode « Commencer ici » : ne demande jamais de rejoindre un point de départ ; commence par ce qui est devant la caméra.
 - Mode « Parcours guidé » : suis l'étape en cours. Si aucun espace n'a encore été visité et que l'étape est l'extérieur,
   la première consigne place l'inspecteur (ex : « Placez-vous face à l'entrée principale, côté rue »).
+  Tant que l'inspecteur n'est pas à l'endroit prévu par l'étape, nextCategory = "" : l'application ne commence les relevés
+  d'un espace qu'après ta première proposition d'élément (nextCategory) dans cet espace.
 
 3. NE PAS REFAIRE CE QUI EST FAIT (bâtiments avec beaucoup de pièces)
 - « Déjà relevé » liste ce qui est documenté. Ne le redemande pas, SAUF s'il est différent ici (autre type de revêtement, autre modèle
@@ -160,6 +162,37 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
 - spaceDone = true quand plus rien d'utile n'est à relever ici ; nextSpace = l'espace voisin conseillé. Sinon spaceDone = false
   et nextSpace = chaîne vide (sauf si l'inspecteur demande l'espace suivant).
 
+8. ÉLÉMENT EN COURS (séquence imposée par l'application) — PRIORITAIRE sur les règles 2 à 6
+- Quand un « Élément en cours » est indiqué, occupe-toi UNIQUEMENT de son étape en cours. Ne propose aucun autre élément,
+  ne change pas de cible, même si autre chose est visible. nextCategory = "" et nextElement = "".
+- instruction : comment cadrer le sujet de l'étape (« Approchez-vous du coin du vitrage », « Montrez la poignée »),
+  ou « Ne bougez plus » s'il est déjà bien cadré.
+- capture = true DÈS QUE le sujet de l'étape est visible et assez net pour être exploité, même si le cadrage n'est pas parfait.
+  Sois décidé : l'inspecteur attend, immobile, devant l'élément. Ne demande pas de meilleur cadrage pour rien.
+- stepAbsent = true seulement si l'étape est facultative et que son sujet n'existe pas sur cet élément (ex : pas de store) ; sinon false.
+- targetBox : le sujet précis de l'étape (la poignée, le coin du vitrage, la plaque…). target : « Élément — étape ».
+
+9. SANS ÉLÉMENT EN COURS
+- Tout ce qui a été repéré dans cet espace est fait. Cherche ce qui reste : un élément visible pas encore fait, ou une partie
+  de l'espace pas encore filmée (coin caché, plafond, derrière la porte, sous l'évier, placard).
+- Si un élément à relever est visible : nextCategory (catégorie EXACTE du référentiel) et nextElement (élément EXACT du référentiel),
+  instruction « Montrez … », targetBox sur cet élément. Évite les « Éléments déjà faits dans cet espace » et ce qui est
+  « Déjà relevé » (sauf s'il est différent ici ou abîmé).
+- Sinon : instruction pour montrer une partie pas encore vue (« Tournez-vous vers le coin derrière la porte »), nextCategory = "".
+- capture = false.
+- Si plus rien d'utile n'est à faire ici : spaceDone = true, nextSpace renseigné, nextCategory = "" et nextElement = "".
+
+10. REPÉRAGE DES ÉLÉMENTS (à CHAQUE image, y compris pendant un élément en cours)
+- L'inspecteur se déplace librement ; l'application place un repère sur chaque élément que tu signales et le lui fera relever ensuite.
+- elements : TOUS les éléments du référentiel visibles sur l'image, UNE ENTRÉE PAR VARIANTE DISTINCTE : chaque revêtement de sol,
+  de mur ou de plafond différent, chaque peinture différente, chaque type de porte ou de menuiserie intérieure, chaque fenêtre,
+  chaque radiateur, luminaire, tableau, appareil sanitaire… (10 maximum, les plus nets d'abord).
+  · category et element : EXACTS du référentiel (ex : « Substance & Surface » / « Revêtements » pour un parquet ou une peinture).
+  · label : 1 à 4 mots qui distinguent la variante (« Parquet chêne », « Peinture blanche », « Carrelage gris », « Porte bois », « Fenêtre PVC »).
+    Réutilise exactement le libellé de « Déjà repérés » quand c'est le même élément (même s'il est déjà fait).
+  · box : cadre [ymin, xmin, ymax, xmax] de 0 à 1000.
+- Ne liste pas ce qui n'est qu'à peine visible ou trop flou pour être identifié.
+
 RÉFÉRENTIEL (catégorie : éléments (attributs)) :
 `;
 
@@ -187,6 +220,22 @@ export function guideUser(req: GuideRequest): string {
   lines.push(`\nÉléments encore à relever :\n${list(req.missing, 30, 'rien : tout est relevé')}`);
   lines.push(`\nDéjà relevé (ne pas redemander, sauf si différent ici ou abîmé) :\n${list(req.recorded, 45, 'rien pour l’instant')}`);
   lines.push(`\nCapturé, analyse en cours (ne pas redemander) :\n${list(req.inProgress, 15, 'rien')}`);
+  if (req.element) {
+    const pos = req.stepIndex !== undefined && req.stepCount ? ` (étape ${req.stepIndex + 1}/${req.stepCount})` : '';
+    lines.push(`\nÉLÉMENT EN COURS : ${req.element}${req.elementCategory ? ` [${req.elementCategory}]` : ''}`);
+    lines.push(`Étape en cours${pos} : ${req.step ?? ''}${req.stepOptional ? ' (facultative)' : ''}`);
+    if (req.stepAim) lines.push(`La photo doit montrer : ${req.stepAim}`);
+    if (req.nextSteps && req.nextSteps.length) lines.push(`Étapes suivantes : ${req.nextSteps.join(' → ')}`);
+  } else if (req.goingTo) {
+    lines.push(
+      `\nL'INSPECTEUR SE REND VERS : ${req.goingTo}. Tant qu'il n'y est pas, guide-le pour s'y rendre (consigne courte) ; ` +
+        `ne propose aucun élément (nextCategory = "", nextElement = "", capture = false). Dès que l'image montre cet espace, space = ce nom.`,
+    );
+  } else {
+    lines.push(`\nAUCUN ÉLÉMENT EN COURS : propose le prochain élément à relever ici ou une partie à montrer (règle 9).`);
+  }
+  if (req.elementsDoneHere && req.elementsDoneHere.length) lines.push(`Éléments déjà faits dans cet espace : ${req.elementsDoneHere.join(', ')}`);
+  if (req.spotted && req.spotted.length) lines.push(`Déjà repérés dans cet espace : ${req.spotted.join(', ')}`);
   if (req.lastTarget) lines.push(`\nÉlément visé précédemment : « ${req.lastTarget} »`);
   if (req.lastInstruction) lines.push(`Dernière consigne affichée : « ${req.lastInstruction} »`);
   if (req.transcript && req.transcript.trim()) lines.push(`Paroles de l'inspecteur : « ${req.transcript.trim()} »`);

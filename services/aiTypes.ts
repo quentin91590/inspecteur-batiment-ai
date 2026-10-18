@@ -1,5 +1,8 @@
 // Copie côté client du contrat de la fonction serveur (functions/src/types.ts) — garder synchronisé.
 
+// Contrat partagé entre l'application et la fonction serveur « ai ».
+// (Copie côté client : services/aiTypes.ts — garder les deux synchronisés.)
+
 export type SchemaDefinition = Record<string, Record<string, Record<string, string[]>>>;
 
 /** À quoi sert l'appel : chaque usage a son modèle par défaut. */
@@ -66,7 +69,30 @@ export interface GuideRequest {
   lastInstruction?: string;
   /** Élément visé à l'image précédente (pour garder la même cible) */
   lastTarget?: string;
+  /** Séquence en cours, imposée par l'application (ex : « Fenêtre », étape « Vitrage et intercalaire ») */
+  element?: string;
+  elementCategory?: string;
+  step?: string;
+  stepIndex?: number;
+  stepCount?: number;
+  stepAim?: string;
+  stepOptional?: boolean;
+  nextSteps?: string[];
+  /** Éléments déjà faits dans l'espace actuel */
+  elementsDoneHere?: string[];
+  /** Éléments déjà repérés dans cet espace (libellés) */
+  spotted?: string[];
+  /** Espace vers lequel l'inspecteur se dirige (après « Pièce suivante ») */
+  goingTo?: string;
   model?: string;
+}
+
+/** Élément visible à l'image (une entrée par variante : chaque revêtement, chaque peinture…) */
+export interface VisibleElement {
+  category: string;
+  element: string;
+  label: string;
+  box: number[];
 }
 
 export interface ModelsRequest {
@@ -112,6 +138,13 @@ export interface GuideResult {
   targetBox: number[];
   /** Où chercher l'élément visé s'il n'est pas dans l'image */
   targetDirection: TargetDirection;
+  /** Étape facultative dont le sujet n'existe pas ici (pas de store…) */
+  stepAbsent: boolean;
+  /** Sans séquence en cours : prochain élément proposé (catégorie et élément exacts du référentiel) */
+  nextCategory: string;
+  nextElement: string;
+  /** Tous les éléments du référentiel visibles à l'image, avec leur cadre */
+  elements: VisibleElement[];
 }
 
 export interface ModelInfo {

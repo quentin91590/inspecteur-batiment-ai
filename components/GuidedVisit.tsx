@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X, Pause, Play, Mic, MicOff, Flashlight, FlashlightOff, SunMedium, WifiOff, Loader2, CheckCircle2,
   AlertTriangle, ChevronDown, ChevronRight, Sparkles, Sun, ZoomIn, ZoomOut, Focus, Hand, Clock, MapPin,
-  Route, ArrowRight, Navigation, DoorOpen,
+  Route, ArrowRight, Navigation, DoorOpen, SkipForward, ListChecks,
 } from 'lucide-react';
 import type { InspectionItem, QueueItem, SchemaDefinition } from '../types';
 import { AI_COSTS, sortCategories } from '../constants';
@@ -10,18 +10,24 @@ import {
   ALL_ZONES, ALL_ZONES_LABEL, NON_VISUAL_CATEGORIES, buildChecklist, inProgressTargets, missingLines, recordedLines,
 } from '../utils/checklist';
 import { PARCOURS_STAGES, stageText } from '../utils/visit';
+import { protocolFor, type Protocol } from '../utils/protocols';
 import { AiCallError, guideFrame, modelLabel, type AiMeta, type GuideResult } from '../services/aiService';
 import { LOW_LIGHT_FILTER, grabJpeg, grayFrame, meanAbsDiff, meanLuma, smallGray } from '../services/videoFrames';
-import { OrientationSource, TargetTracker, videoToScreen, type ARState } from '../services/arTracker';
+import {
+  OrientationSource, TargetTracker, angleBetween, fieldOfView, project, unproject, videoToScreen,
+  type ARState, type NormBox, type Vec3,
+} from '../services/arTracker';
+import type { VisibleElement } from '../services/aiTypes';
 
 // ------------------------------------------------------------------ réglages du guidage
 
-const TICK_MS = 400;              // analyse locale de l'image (mouvement, luminosité)
-const MIN_SEND_GAP_MS = 1800;     // au plus une image envoyée à l'IA toutes les ~2 s
-const MAX_SEND_GAP_MS = 7000;     // même sans changement, on rafraîchit la consigne
+const TICK_MS = 250;              // analyse locale de l'image (mouvement, luminosité)
+const MIN_SEND_GAP_MS = 1800;     // sans élément en cours : au plus une image toutes les ~2 s
+const STEP_SEND_GAP_MS = 1100;    // pendant une étape : dès que l'image est stable, sans attendre un changement de scène
+const MAX_SEND_GAP_MS = 4000;     // même sans changement, on rafraîchit la consigne
 const MOTION_STABLE = 6;          // différence moyenne (0-255) sous laquelle l'image est jugée stable
 const NOVELTY_MIN = 9;            // différence avec la dernière image envoyée pour la juger « nouvelle »
-const CAPTURE_GAP_MS = 3500;      // délai minimum entre deux photos automatiques
+const CAPTURE_GAP_MS = 1500;      // délai minimum entre deux photos automatiques
 const SAME_TARGET_GAP_MS = 30000; // pas deux photos du même élément en 30 s
 const PENDING_CAPTURE_MS = 5000;  // la photo demandée attend au plus 5 s que l'image soit stable
 const OFFLINE_CAPTURE_GAP_MS = 8000;
@@ -30,6 +36,11 @@ const GUIDE_MAX_SIDE = 768;       // image envoyée pour le guidage
 const HD_MAX_SIDE = 1280;         // photo analysée en détail
 const DARK_LUMA = 38;
 const TRACK_EVERY_MS = 120;       // recalage du cadre par l'image
+const MAX_POINTS = 30;            // repères par pièce
+const SAME_DIR_DEG = 12;          // même élément signalé sous un autre nom s'il est dans la même direction
+const RECENT_BOX_MS = 2500;       // sans gyroscope, un repère n'est affiché que peu après avoir été vu
+const SPEECH_HINT_MS = 9000;
+const LEAVING_MS = 45000;         // après « Pièce suivante », on ne ramène pas l'inspecteur dans la pièce quittée
 
 export interface GuidedCapture {
   id: string;
@@ -73,6 +84,42 @@ interface SpaceVisit {
   photos: number;
 }
 
+/** Élément en cours de relevé : séquence d'étapes verrouillée jusqu'à la fin */
+interface ActiveElement {
+  protocol: Protocol;
+  title: string;
+  category: string;
+  element: string;
+  stepIdx: number;
+  photos: number;
+  pointId?: string;
+}
+
+interface DoneElement {
+  title: string;
+  photos: number;
+  space: string;
+}
+
+/** Élément repéré dans l'espace actuel, ancré par sa direction (gyroscope) */
+interface SpacePoint {
+  id: string;
+  category: string;
+  element: string;
+  label: string;
+  dir: Vec3 | null;
+  box: NormBox | null;
+  seenAt: number;
+  createdAt: number;
+  status: 'todo' | 'active' | 'done' | 'skipped';
+  photos: number;
+}
+
+interface RoomState {
+  points: SpacePoint[];
+  doneHere: string[];
+}
+
 type CameraState = 'idle' | 'starting' | 'ready' | 'error';
 type VisitMode = 'libre' | 'parcours';
 type LightMode = 'off' | 'torch' | 'boost';
@@ -94,10 +141,13 @@ const HINT_VECTOR: Record<string, [number, number]> = {
   derriere: [0, 1],
 };
 
+/** [ymin, xmin, ymax, xmax] (0-1000) → cadre normalisé (0-1) */
+const boxFromArray = (b: number[]): NormBox => ({ cx: (b[1] + b[3]) / 2000, cy: (b[0] + b[2]) / 2000, w: (b[3] - b[1]) / 1000, h: (b[2] - b[0]) / 1000 });
+const normText = (s: string) => s.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
 const newId = () => `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 const fmtSeconds = (ms?: number) => (ms === undefined ? '' : `${(ms / 1000).toFixed(1).replace('.', ',')} s`);
-const sameText = (a?: string, b?: string) =>
-  !!a && !!b && a.trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '') === b.trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+const sameText = (a?: string, b?: string) => !!a && !!b && normText(a) === normText(b);
 
 export const GuidedVisit: React.FC<Props> = ({
   schema, items, queue, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
@@ -133,6 +183,12 @@ export const GuidedVisit: React.FC<Props> = ({
   const [spaces, setSpaces] = useState<SpaceVisit[]>([]);
   const [spaceDone, setSpaceDone] = useState<string | null>(null);
   const [askingNext, setAskingNext] = useState(false);
+  const [active, setActive] = useState<ActiveElement | null>(null);
+  const [doneElements, setDoneElements] = useState<DoneElement[]>([]);
+  const [roomPoints, setRoomPoints] = useState<SpacePoint[]>([]);
+  const [roomListOpen, setRoomListOpen] = useState(false);
+  const [speechHint, setSpeechHint] = useState(false);
+  const [spokenSent, setSpokenSent] = useState(false);
 
   // ---------------------------------------------------------------- références (lues par les boucles)
   const containerRef = useRef<HTMLDivElement>(null);
@@ -169,6 +225,14 @@ export const GuidedVisit: React.FC<Props> = ({
   lightRef.current = light;
   const showSetupRef = useRef(showSetup);
   showSetupRef.current = showSetup;
+  const activeRef = useRef<ActiveElement | null>(active);
+  activeRef.current = active;
+  const doneHereRef = useRef<string[]>([]);
+  const pointsRef = useRef<SpacePoint[]>([]);
+  const pinsLayerRef = useRef<HTMLDivElement>(null);
+  const pinElsRef = useRef(new Map<string, HTMLDivElement>());
+  const onPinTapRef = useRef<(id: string) => void>(() => undefined);
+  const roomsRef = useRef(new Map<string, RoomState>());
 
   const prevSmallRef = useRef<Uint8ClampedArray | null>(null);
   const lastSentSmallRef = useRef<Uint8ClampedArray | null>(null);
@@ -188,6 +252,12 @@ export const GuidedVisit: React.FC<Props> = ({
   capturesRef.current = captures;
   const requestNextRef = useRef(false);
   const spaceCandidateRef = useRef<{ name: string; count: number } | null>(null);
+  // Éléments vus pendant qu'un changement de pièce n'est pas encore confirmé : rangés une fois la pièce connue
+  const deferredRef = useRef<{ elements: VisibleElement[]; pose: ReturnType<OrientationSource['pose']>; dims: { w: number; h: number } }[]>([]);
+  // « Pièce suivante » : en route vers une autre pièce
+  const leavingRef = useRef<{ from: string; to: string; until: number } | null>(null);
+  // Parcours guidé : espace où l'IA a commencé les relevés (avant, elle guide vers le point de départ)
+  const startedSpaceRef = useRef<string | null>(null);
 
   // ---------------------------------------------------------------- thèmes et progression
   const themes = useMemo(() => sortCategories(Object.keys(schema)).filter(c => !NON_VISUAL_CATEGORIES.includes(c)), [schema]);
@@ -198,6 +268,8 @@ export const GuidedVisit: React.FC<Props> = ({
     setToast(msg);
     window.setTimeout(() => setToast(t => (t === msg ? '' : t)), 2600);
   }, []);
+  const setToastRef = useRef(showToast);
+  setToastRef.current = showToast;
 
   // ---------------------------------------------------------------- caméra
   const stopCamera = useCallback(() => {
@@ -351,6 +423,7 @@ export const GuidedVisit: React.FC<Props> = ({
           speechBufferRef.current = `${speechBufferRef.current} ${t}`.trim();
           speechSinceCaptureRef.current = `${speechSinceCaptureRef.current} ${t}`.trim();
           setLastSpoken(t);
+          setSpokenSent(false);
         } else {
           partial += `${t} `;
         }
@@ -432,7 +505,42 @@ export const GuidedVisit: React.FC<Props> = ({
   }, [phase, cameraState]);
 
   // ---------------------------------------------------------------- espaces parcourus
+  /** Mémorise les repères de la pièce actuelle (pour y revenir et pour le bilan). */
+  const saveRoom = useCallback(() => {
+    const name = visitRef.current.currentSpace;
+    if (name) roomsRef.current.set(normText(name), { points: pointsRef.current, doneHere: doneHereRef.current });
+  }, []);
+
+  /** Nouvelle pièce : ses repères repartent de zéro (ou de ceux mémorisés si on y revient). */
   const enterSpace = useCallback((name: string) => {
+    const prevName = visitRef.current.currentSpace;
+    const prev = pointsRef.current;
+    if (!prevName) {
+      // Pièce identifiée pour la première fois : les repères déjà posés sont les siens
+      roomsRef.current.set(normText(name), { points: prev, doneHere: doneHereRef.current });
+    } else {
+      const staying = prev;
+      // L'élément en cours appartient à la pièce quittée : il reste à faire là-bas
+      const a = activeRef.current;
+      if (a && staying.some(pt => pt.id === a.pointId)) {
+        staying.forEach(pt => {
+          if (pt.id === a.pointId) pt.status = 'todo';
+        });
+        activeRef.current = null;
+        setActive(null);
+        trackerRef.current.clear();
+        pendingCaptureRef.current = null;
+        setPendingCapture(false);
+        setInstruction(null);
+      }
+      roomsRef.current.set(normText(prevName), { points: staying, doneHere: doneHereRef.current });
+      const saved = roomsRef.current.get(normText(name));
+      pointsRef.current = saved?.points ?? [];
+      doneHereRef.current = saved?.doneHere ?? [];
+      leavingRef.current = null;
+    }
+    visitRef.current = { ...visitRef.current, currentSpace: name };
+    setRoomPoints([...pointsRef.current]);
     setCurrentSpace(name);
     setSpaces(prev => (prev.length && sameText(prev[prev.length - 1].name, name) ? prev : [...prev, { name, photos: 0 }]));
     setSpaceDone(null);
@@ -462,10 +570,200 @@ export const GuidedVisit: React.FC<Props> = ({
     }
   }, [enterSpace]);
 
+  // ---------------------------------------------------------------- séquence par élément
+  const stepTarget = (a: ActiveElement) => `${a.title} — ${a.protocol.steps[a.stepIdx].label}`;
+
+  const setActiveNow = (a: ActiveElement | null) => {
+    activeRef.current = a;
+    setActive(a);
+  };
+
+  // ---------------------------------------------------------------- repères : éléments repérés dans la pièce
+  const syncPoints = useCallback(() => setRoomPoints([...pointsRef.current]), []);
+
+  /** Repère de la pièce actuelle ou d'une pièce déjà parcourue. */
+  const findPoint = (id?: string): SpacePoint | undefined => {
+    if (!id) return undefined;
+    const here = pointsRef.current.find(pt => pt.id === id);
+    if (here) return here;
+    for (const room of roomsRef.current.values()) {
+      const found = room.points.find(pt => pt.id === id);
+      if (found) return found;
+    }
+    return undefined;
+  };
+
+  const addPoint = (pt: Pick<SpacePoint, 'category' | 'element' | 'label' | 'dir' | 'box'>): SpacePoint => {
+    const now = Date.now();
+    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, status: 'todo', photos: 0 };
+    pointsRef.current = [...pointsRef.current, point];
+    return point;
+  };
+
+  /**
+   * Éléments signalés par l'IA sur l'image envoyée : chacun devient un repère, ancré par sa direction
+   * (orientation du téléphone au moment de l'image). Un élément déjà repéré (même libellé) est simplement mis à jour.
+   */
+  const ingestElements = (elements: VisibleElement[], pose: ReturnType<OrientationSource['pose']>, vdims: { w: number; h: number }) => {
+    if (!elements.length) return;
+    const { schema: sch } = propsRef.current;
+    const th = visitRef.current.theme;
+    const fov = fieldOfView(vdims.w || 16, vdims.h || 9);
+    const now = Date.now();
+    let changed = false;
+    for (const e of elements) {
+      if (!sch[e.category] || NON_VISUAL_CATEGORIES.includes(e.category)) continue;
+      if (th !== ALL_ZONES && e.category !== th) continue;
+      if (e.box.length !== 4 || !e.label) continue;
+      const box = boxFromArray(e.box);
+      const dir = pose ? unproject(box.cx, box.cy, pose, fov) : null;
+      const pts = pointsRef.current;
+      let pt = pts.find(q => q.category === e.category && sameText(q.label, e.label));
+      if (!pt && dir) pt = pts.find(q => q.category === e.category && q.element === e.element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
+      if (pt) {
+        if (dir && (!pt.dir || pt.status === 'todo')) pt.dir = dir;
+        pt.box = box;
+        pt.seenAt = now;
+        continue;
+      }
+      if (pts.length >= MAX_POINTS) continue;
+      addPoint({ category: e.category, element: e.element, label: e.label, dir, box });
+      changed = true;
+    }
+    if (changed) syncPoints();
+  };
+
+  /** Prochain élément : le repère « à faire » le plus proche de là où vise le téléphone. */
+  const pickNextPoint = useCallback((): SpacePoint | null => {
+    const todo = pointsRef.current.filter(pt => pt.status === 'todo');
+    if (!todo.length) return null;
+    const pose = orientationRef.current.pose();
+    const withDir = pose ? todo.filter(pt => pt.dir) : [];
+    if (pose && withDir.length) {
+      return withDir.reduce((best, pt) => (angleBetween(pt.dir!, pose.forward) < angleBetween(best.dir!, pose.forward) ? pt : best));
+    }
+    return todo.reduce((best, pt) => (pt.seenAt > best.seenAt ? pt : best)); // sans gyroscope : le dernier vu
+  }, []);
+
+  const startPoint = useCallback((pt: SpacePoint) => {
+    const protocol = protocolFor(pt.category, pt.element);
+    pt.status = 'active';
+    const a: ActiveElement = {
+      protocol, title: pt.label || protocol.title, category: pt.category, element: pt.element, stepIdx: 0, photos: 0, pointId: pt.id,
+    };
+    setActiveNow(a);
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    const recent = Date.now() - pt.seenAt < RECENT_BOX_MS;
+    trackerRef.current.setKnown(stepTarget(a), pt.dir, pt.dir || recent ? pt.box : null);
+    lastSentAtRef.current = 0;
+    setInstruction({
+      text: protocol.steps[0].instruction,
+      detail: pt.dir ? 'Suivez le repère jaune' : '',
+      target: stepTarget(a),
+      quality: 'ok',
+      key: Date.now(),
+    });
+    syncPoints();
+  }, [syncPoints]);
+
+  /** Remet l'élément en cours dans la liste (« à faire » ou « passé »). */
+  const releaseActive = (status: 'todo' | 'skipped' = 'todo') => {
+    const a = activeRef.current;
+    const pt = findPoint(a?.pointId);
+    if (pt && pt.status === 'active') pt.status = status;
+    setActiveNow(null);
+    trackerRef.current.clear();
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    syncPoints();
+  };
+
+  const finishElement = useCallback((a: ActiveElement, photos: number, status: 'done' | 'skipped' = 'done') => {
+    const final = status === 'done' && photos === 0 ? 'skipped' : status;
+    const pt = findPoint(a.pointId);
+    if (pt) {
+      pt.status = final;
+      pt.photos += photos;
+    }
+    if (!doneHereRef.current.some(t => sameText(t, a.title))) doneHereRef.current = [...doneHereRef.current, a.title];
+    if (final === 'done') setDoneElements(prev => [...prev, { title: a.title, photos, space: visitRef.current.currentSpace }]);
+    setActiveNow(null);
+    trackerRef.current.clear();
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    lastSentAtRef.current = 0;
+    const msg = final === 'done' ? `${a.title} ✓ (${photos} photo${photos > 1 ? 's' : ''})` : `${a.title} : passé`;
+    // On enchaîne sur le repère le plus proche
+    const next = pickNextPoint();
+    if (next) {
+      startPoint(next);
+      setToastRef.current(`${msg} · ensuite : ${next.label}`);
+    } else {
+      setInstruction(null);
+      syncPoints();
+      setToastRef.current(msg);
+    }
+  }, [pickNextPoint, startPoint, syncPoints]);
+
+  /** Passe à l'étape suivante (photo prise, étape absente ou passée par l'inspecteur). */
+  const advanceStep = useCallback((reason: 'photo' | 'absent' | 'skip') => {
+    const a = activeRef.current;
+    if (!a) return;
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    const photos = a.photos + (reason === 'photo' ? 1 : 0);
+    const next = a.stepIdx + 1;
+    if (next >= a.protocol.steps.length) {
+      finishElement(a, photos);
+      return;
+    }
+    const na: ActiveElement = { ...a, stepIdx: next, photos };
+    setActiveNow(na);
+    // Le repère reste sur l'élément ; l'IA le recale sur le sujet de la nouvelle étape
+    const pt = findPoint(a.pointId);
+    trackerRef.current.setKnown(stepTarget(na), pt?.dir ?? null, pt && (pt.dir || Date.now() - pt.seenAt < RECENT_BOX_MS) ? pt.box : null);
+    lastSentAtRef.current = 0; // la nouvelle étape part tout de suite
+    const prevLabel = a.protocol.steps[a.stepIdx].label;
+    setInstruction({
+      text: na.protocol.steps[next].instruction,
+      detail: reason === 'absent' ? `${prevLabel} : absent ici, étape passée` : reason === 'photo' ? `${prevLabel} ✓` : '',
+      target: stepTarget(na),
+      quality: 'ok',
+      key: Date.now(),
+    });
+  }, [finishElement]);
+
+  /** « Autre élément » : celui-ci passe en gris (on pourra y revenir), on va au repère le plus proche. */
+  const abandonElement = () => {
+    const a = activeRef.current;
+    if (!a) return;
+    finishElement(a, a.photos, 'skipped');
+  };
+
+  /** Choix d'un repère (toucher le repère ou la liste de la pièce). */
+  const choosePoint = (id: string, allowDone: boolean) => {
+    const pt = pointsRef.current.find(q => q.id === id);
+    if (!pt || pt.status === 'active') return;
+    if (pt.status === 'done' && !allowDone) {
+      showToast(`${pt.label} : déjà relevé ✓`);
+      return;
+    }
+    leavingRef.current = null;
+    releaseActive('todo');
+    startPoint(pt);
+    setRoomListOpen(false);
+  };
+  onPinTapRef.current = id => choosePoint(id, false);
+
   // ---------------------------------------------------------------- photo haute définition
-  const doCapture = useCallback(async (target: string, origin: 'ai' | 'manuel' | 'auto') => {
+  const doCapture = useCallback(async (requested: string, origin: 'ai' | 'manuel' | 'auto') => {
     const video = videoRef.current;
     if (!video || capturingRef.current) return;
+    // Pendant une séquence, la photo documente l'étape en cours (et la fait avancer)
+    const stepAtCapture = origin !== 'auto' ? activeRef.current : null;
+    const step = stepAtCapture ? stepAtCapture.protocol.steps[stepAtCapture.stepIdx] : null;
+    const target = stepAtCapture && step ? `${stepTarget(stepAtCapture)} (${step.aim})` : requested;
     if (propsRef.current.userCoins < AI_COSTS.IMAGE_ANALYSIS) {
       setBlockMsg(`Crédits insuffisants pour analyser une photo (${AI_COSTS.IMAGE_ANALYSIS} crédits).`);
       return;
@@ -497,16 +795,20 @@ export const GuidedVisit: React.FC<Props> = ({
       } catch {
         /* pas de vibreur */
       }
-      showToast(origin === 'auto' ? 'Photo enregistrée (hors réseau)' : `Photo prise${target ? ` : ${target}` : ''}`);
+      if (stepAtCapture && activeRef.current && activeRef.current.title === stepAtCapture.title && activeRef.current.stepIdx === stepAtCapture.stepIdx) {
+        advanceStep('photo');
+      } else {
+        showToast(origin === 'auto' ? 'Photo enregistrée (hors réseau)' : `Photo prise${requested ? ` : ${requested}` : ''}`);
+      }
     } finally {
       capturingRef.current = false;
     }
-  }, [showToast]);
+  }, [showToast, advanceStep]);
 
-  const requestCapture = useCallback((target: string) => {
+  const requestCapture = useCallback((target: string, fromStep = false) => {
     const now = Date.now();
     if (now - lastCaptureAtRef.current < CAPTURE_GAP_MS) return;
-    const last = target ? targetTimesRef.current.get(target) : undefined;
+    const last = target && !fromStep ? targetTimesRef.current.get(target) : undefined;
     if (last && now - last < SAME_TARGET_GAP_MS) return;
     pendingCaptureRef.current = { target, until: now + PENDING_CAPTURE_MS };
     setPendingCapture(true);
@@ -536,6 +838,10 @@ export const GuidedVisit: React.FC<Props> = ({
     const transcript = speechBufferRef.current;
     speechBufferRef.current = '';
     const askNext = requestNextRef.current;
+    const activeAtSend = activeRef.current;
+    const leaving = leavingRef.current;
+    const goingTo = leaving && Date.now() < leaving.until && sameText(leaving.from, v.currentSpace) ? leaving.to : undefined;
+    const stepAtSend = activeAtSend ? activeAtSend.protocol.steps[activeAtSend.stepIdx] : undefined;
 
     try {
       const { guide, meta } = await guideFrame({
@@ -554,8 +860,20 @@ export const GuidedVisit: React.FC<Props> = ({
         transcript,
         lastInstruction: instructionRef.current?.text,
         lastTarget: instructionRef.current?.target,
+        element: activeAtSend?.title,
+        elementCategory: activeAtSend?.category,
+        step: stepAtSend?.label,
+        stepIndex: activeAtSend?.stepIdx,
+        stepCount: activeAtSend?.protocol.steps.length,
+        stepAim: stepAtSend?.aim,
+        stepOptional: stepAtSend?.optional,
+        nextSteps: activeAtSend ? activeAtSend.protocol.steps.slice(activeAtSend.stepIdx + 1).map(st => st.label) : undefined,
+        elementsDoneHere: doneHereRef.current,
+        spotted: pointsRef.current.map(pt => pt.label).slice(0, 30),
+        goingTo,
       });
       failuresRef.current = 0;
+      if (transcript) setSpokenSent(true);
       if (askNext) {
         requestNextRef.current = false;
         setAskingNext(false);
@@ -564,16 +882,76 @@ export const GuidedVisit: React.FC<Props> = ({
         setNetMode('online');
         showToast('Réseau retrouvé : guidage réactivé');
       }
-      setInstruction({ text: guide.instruction, detail: guide.detail, target: guide.target, quality: guide.sceneQuality, key: Date.now() });
+      // La réponse concerne-t-elle toujours l'étape en cours ? (l'inspecteur a pu passer l'étape entre-temps)
+      const current = activeRef.current;
+      const sameStep = !!activeAtSend && !!current && current.title === activeAtSend.title && current.stepIdx === activeAtSend.stepIdx;
+      const staleStep = !!activeAtSend && !sameStep;
+
+      if (!staleStep) {
+        setInstruction({
+          text: guide.instruction,
+          detail: guide.detail,
+          target: current ? stepTarget(current) : guide.target,
+          quality: guide.sceneQuality,
+          key: Date.now(),
+        });
+      }
       setSeenNow(guide.seen.map(s => s.subCategory));
       setLastMeta(meta);
       setStats(s => ({ ...s, frames: s.frames + 1, latencyTotal: s.latencyTotal + (meta?.latencyMs ?? 0) }));
+      if (askNext) {
+        leavingRef.current = v.currentSpace ? { from: v.currentSpace, to: guide.nextSpace, until: Date.now() + LEAVING_MS } : null;
+      }
       onSpaceSeen(guide.space);
-      setSpaceDone(guide.spaceDone && guide.nextSpace ? guide.nextSpace : askNext && guide.nextSpace ? guide.nextSpace : null);
+      const stillLeaving = !!goingTo && !!leavingRef.current;
+      setSpaceDone(
+        guide.spaceDone && guide.nextSpace ? guide.nextSpace : askNext && guide.nextSpace ? guide.nextSpace : stillLeaving ? leavingRef.current!.to || null : null,
+      );
+      // Repères : tout ce que l'IA a vu sur cette image (même pendant un élément en cours).
+      // Si l'IA croit voir une autre pièce sans que ce soit confirmé, on attend de savoir où ranger ces éléments.
+      if (spaceCandidateRef.current) {
+        deferredRef.current = [...deferredRef.current, { elements: guide.elements ?? [], pose: poseAtSend, dims: videoDims }].slice(-3);
+      } else {
+        for (const d of deferredRef.current.splice(0)) ingestElements(d.elements, d.pose, d.dims);
+        ingestElements(guide.elements ?? [], poseAtSend, videoDims);
+      }
+
+      // Séquence : étape absente, photo de l'étape, ou démarrage du prochain élément
+      let started: 'point' | 'ai' | null = null;
+      if (sameStep && current) {
+        const step = current.protocol.steps[current.stepIdx];
+        if (guide.stepAbsent && step.optional) {
+          advanceStep('absent');
+          return;
+        }
+        if (guide.capture && !pausedRef.current) requestCapture(stepTarget(current), true);
+      } else if (!activeAtSend && !current && !askNext && !(leavingRef.current && Date.now() < leavingRef.current.until)) {
+        // Parcours guidé : on attend que l'IA lance les relevés dans cet espace (elle peut d'abord guider vers l'étape)
+        const here = normText(visitRef.current.currentSpace || guide.space || '');
+        if (v.mode === 'parcours' && guide.nextCategory) startedSpaceRef.current = here;
+        const canStart = v.mode !== 'parcours' || startedSpaceRef.current === here;
+        const next = canStart ? pickNextPoint() : null;
+        if (next) {
+          startPoint(next);
+          started = 'point';
+        } else if (canStart && guide.nextCategory && propsRef.current.schema[guide.nextCategory]) {
+          // Rien de repéré à faire : l'IA propose un élément
+          const proposed = protocolFor(guide.nextCategory, guide.nextElement);
+          const label = (guide.target.split('—')[0] ?? '').trim() || proposed.title;
+          const known = pointsRef.current.find(pt => sameText(pt.label, label));
+          if (!known && !doneHereRef.current.some(t => sameText(t, label))) {
+            const box = guide.targetBox.length === 4 ? boxFromArray(guide.targetBox) : null;
+            const dir = box && poseAtSend ? unproject(box.cx, box.cy, poseAtSend, fieldOfView(videoDims.w || 16, videoDims.h || 9)) : null;
+            startPoint(addPoint({ category: guide.nextCategory, element: guide.nextElement, label, dir, box }));
+            started = 'ai';
+          }
+        }
+      }
+      if (staleStep || started === 'point') return;
 
       // Surbrillance de l'élément visé
       const tracker = trackerRef.current;
-      const label = guide.target || guide.instruction;
+      const label = activeRef.current ? stepTarget(activeRef.current) : guide.target || guide.instruction;
       if (guide.targetBox.length === 4) {
         const [ymin, xmin, ymax, xmax] = guide.targetBox;
         tracker.setTarget(
@@ -589,7 +967,7 @@ export const GuidedVisit: React.FC<Props> = ({
         else tracker.clear();
       }
 
-      if (guide.capture && !pausedRef.current) requestCapture(guide.target);
+      if (!activeAtSend && !activeRef.current && guide.capture && !pausedRef.current) requestCapture(guide.target);
     } catch (err) {
       speechBufferRef.current = `${transcript} ${speechBufferRef.current}`.trim();
       if (err instanceof AiCallError) {
@@ -608,7 +986,7 @@ export const GuidedVisit: React.FC<Props> = ({
       inFlightRef.current = false;
       setWaiting(false);
     }
-  }, [onSpaceSeen, requestCapture, showToast]);
+  }, [onSpaceSeen, requestCapture, showToast, advanceStep, pickNextPoint, startPoint]);
 
   // ---------------------------------------------------------------- boucle principale (mouvement, envoi, photos)
   const tick = useCallback(() => {
@@ -665,6 +1043,11 @@ export const GuidedVisit: React.FC<Props> = ({
       return;
     }
     const sinceSent = now - lastSentAtRef.current;
+    if (activeRef.current) {
+      // Pendant une étape : dès que l'image est stable, on demande à l'IA si le sujet est bien cadré
+      if ((stable && sinceSent >= STEP_SEND_GAP_MS) || sinceSent > MAX_SEND_GAP_MS) void sendFrame(small);
+      return;
+    }
     if (sinceSent < MIN_SEND_GAP_MS) return;
     const novelty = meanAbsDiff(small, lastSentSmallRef.current);
     const hasSpeech = speechBufferRef.current.length > 0;
@@ -690,6 +1073,113 @@ export const GuidedVisit: React.FC<Props> = ({
       if (el && el.style.display !== 'none') el.style.display = 'none';
     };
 
+    // Repères des éléments repérés : jaune = à faire, vert = fait, gris = passé.
+    // Hors écran, un élément à faire reste signalé par un petit point au bord, du côté où il se trouve.
+    const pinEls = pinElsRef.current;
+    const makePin = (id: string) => {
+      const el = document.createElement('div');
+      el.setAttribute('data-testid', 'ar-mini');
+      const dot = document.createElement('span');
+      dot.className = 'ar-mini-dot';
+      const lab = document.createElement('span');
+      lab.className = 'ar-mini-label';
+      el.append(dot, lab);
+      const tap = (ev: Event) => {
+        ev.stopPropagation();
+        onPinTapRef.current(id);
+      };
+      dot.addEventListener('click', tap);
+      lab.addEventListener('click', tap);
+      return el;
+    };
+    const renderPins = (vdim: { w: number; h: number }, vw: number, vh: number) => {
+      const layer = pinsLayerRef.current;
+      if (!layer) return;
+      const pts = pointsRef.current;
+      for (const [id, el] of pinEls) {
+        if (!pts.some(pt => pt.id === id)) {
+          el.remove();
+          pinEls.delete(id);
+        }
+      }
+      layer.style.display = showSetupRef.current ? 'none' : '';
+      if (showSetupRef.current) return;
+      const pose = orientationRef.current.pose();
+      const fov = fieldOfView(vdim.w, vdim.h);
+      const now = Date.now();
+      const activeId = activeRef.current?.pointId;
+      const top = Math.min(240, vh * 0.32);
+      const bottom = vh - Math.min(260, vh * 0.34);
+      const placed: { x: number; y: number }[] = [];
+      // À faire d'abord : en cas de chevauchement, c'est leur nom qui reste lisible
+      const order = [...pts].sort((a, b) => (a.status === 'todo' ? 0 : 1) - (b.status === 'todo' ? 0 : 1));
+      for (const pt of order) {
+        let el = pinEls.get(pt.id);
+        if (!el) {
+          el = makePin(pt.id);
+          layer.appendChild(el);
+          pinEls.set(pt.id, el);
+        }
+        const lab = el.lastChild as HTMLElement;
+        if (lab.textContent !== pt.label) lab.textContent = pt.label;
+        if (pt.id === activeId || pt.status === 'active') {
+          hide(el); // l'élément en cours a son grand repère
+          continue;
+        }
+        let x = 0;
+        let y = 0;
+        let edge = false;
+        let visible = false;
+        if (pose && pt.dir) {
+          const pr = project(pt.dir, pose, fov);
+          const sc = videoToScreen(pr.cx, pr.cy, vdim, { w: vw, h: vh });
+          if (!pr.behind && sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
+            x = sc.x;
+            y = sc.y;
+            visible = true;
+          } else if (pt.status === 'todo') {
+            const cx = vw / 2;
+            const cy = (top + bottom) / 2;
+            const dx = sc.x - cx;
+            const dy = pr.behind ? 0 : sc.y - cy;
+            const len = Math.hypot(dx, dy) || 1;
+            const ux = dx / len;
+            const uy = dy / len;
+            const tx = ux > 0 ? (vw - 14 - cx) / ux : ux < 0 ? (14 - cx) / ux : Infinity;
+            const ty = uy > 0 ? (bottom - cy) / uy : uy < 0 ? (top - cy) / uy : Infinity;
+            const t = Math.min(tx, ty);
+            x = cx + ux * t;
+            y = cy + uy * t;
+            visible = true;
+            edge = true;
+          }
+        } else if (pt.box && now - pt.seenAt < RECENT_BOX_MS) {
+          const sc = videoToScreen(pt.box.cx, pt.box.cy, vdim, { w: vw, h: vh });
+          if (sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
+            x = sc.x;
+            y = sc.y;
+            visible = true;
+          }
+        }
+        if (!visible) {
+          hide(el);
+          continue;
+        }
+        const cls = `ar-mini ar-${pt.status}${edge ? ' ar-edge' : ''}`;
+        if (el.className !== cls) {
+          el.className = cls;
+          el.setAttribute('data-status', pt.status);
+          (el.firstChild as HTMLElement).textContent = pt.status === 'done' ? '✓' : pt.status === 'skipped' ? '–' : '';
+        }
+        if (el.style.display !== 'block') el.style.display = 'block';
+        el.style.transform = `translate(${x}px, ${y}px)`;
+        // Deux repères presque au même endroit : un seul nom affiché
+        const crowded = !edge && placed.some(q => Math.abs(q.x - x) < 90 && Math.abs(q.y - y) < 22);
+        lab.style.visibility = crowded ? 'hidden' : '';
+        if (!edge) placed.push({ x, y });
+      }
+    };
+
     const render = () => {
       raf = requestAnimationFrame(render);
       const video = videoRef.current;
@@ -697,6 +1187,7 @@ export const GuidedVisit: React.FC<Props> = ({
       const box = boxRef.current;
       const arrow = arrowRef.current;
       if (!video || !view || !box || !arrow || !video.videoWidth) return;
+      renderPins({ w: video.videoWidth, h: video.videoHeight }, view.clientWidth, view.clientHeight);
       const tracker = trackerRef.current;
       if (!tracker.active || showSetupRef.current) {
         hide(box);
@@ -716,23 +1207,21 @@ export const GuidedVisit: React.FC<Props> = ({
       const state: ARState = tracker.update(vdim, gray);
 
       if (state.kind === 'box') {
+        // Petit repère posé sur l'élément (centre du cadre), qui suit l'élément en direct
         const c = videoToScreen(state.box.cx, state.box.cy, vdim, { w: vw, h: vh });
-        const w = Math.max(56, state.box.w * vdim.w * c.scale);
-        const h = Math.max(56, state.box.h * vdim.h * c.scale);
-        const onScreen = c.x > -w / 2 && c.x < vw + w / 2 && c.y > -h / 2 && c.y < vh + h / 2;
+        const onScreen = c.x > 8 && c.x < vw - 8 && c.y > 8 && c.y < vh - 8;
         if (onScreen) {
           box.style.display = 'block';
-          box.style.transform = `translate(${c.x - w / 2}px, ${c.y - h / 2}px)`;
-          box.style.width = `${w}px`;
-          box.style.height = `${h}px`;
+          box.style.transform = `translate(${c.x}px, ${c.y}px)`;
           box.classList.toggle('ar-weak', !state.confident);
           const lab = boxLabelRef.current;
           if (lab) {
-            if (lab.textContent !== state.label) lab.textContent = state.label;
-            // Étiquette toujours lisible : recalée dans l'écran, et dans le cadre s'il touche le haut
-            lab.style.left = `${Math.max(-3, 8 - (c.x - w / 2))}px`;
-            lab.style.bottom = c.y - h / 2 < 40 ? 'auto' : '';
-            lab.style.top = c.y - h / 2 < 40 ? '6px' : '';
+            const short = state.label.replace(' — ', ' · ');
+            if (lab.textContent !== short) lab.textContent = short;
+            // Étiquette gardée dans l'écran
+            const lw = lab.offsetWidth;
+            const shift = Math.min(Math.max(c.x - lw / 2, 8), vw - 8 - lw) - (c.x - lw / 2);
+            lab.style.transform = `translateX(calc(-50% + ${shift}px))`;
           }
           hide(arrow);
           return;
@@ -788,7 +1277,11 @@ export const GuidedVisit: React.FC<Props> = ({
       }
     };
     raf = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      cancelAnimationFrame(raf);
+      pinEls.forEach(el => el.remove());
+      pinEls.clear();
+    };
   }, [phase, cameraState]);
 
   // ---------------------------------------------------------------- crédits par minute de guidage
@@ -823,7 +1316,7 @@ export const GuidedVisit: React.FC<Props> = ({
     setMode(m);
     setShowSetup(false);
     setInstruction(null);
-    trackerRef.current.clear();
+    releaseActive('todo');
     lastSentAtRef.current = 0;
     if (changedMode || phase !== 'running') setStageIdx(0);
     if (phase !== 'running') {
@@ -833,12 +1326,20 @@ export const GuidedVisit: React.FC<Props> = ({
       });
       setPhase('running');
       setMicOn(speechSupported);
+      flashSpeechHint();
       setStats(s => ({ ...s, startedAt: Date.now() }));
       void startCamera();
     }
   };
 
+  const flashSpeechHint = () => {
+    setSpeechHint(true);
+    window.setTimeout(() => setSpeechHint(false), SPEECH_HINT_MS);
+  };
+
   const askNextSpace = () => {
+    releaseActive('todo');
+    setInstruction(null);
     requestNextRef.current = true;
     setAskingNext(true);
     setSpaceDone(null);
@@ -859,6 +1360,7 @@ export const GuidedVisit: React.FC<Props> = ({
     stopSpeech();
     stopCamera();
     orientationRef.current.stop();
+    saveRoom();
     setStats(s => ({ ...s, endedAt: Date.now() }));
     setPhase('summary');
   };
@@ -875,6 +1377,11 @@ export const GuidedVisit: React.FC<Props> = ({
   const offline = netMode === 'offline' || isOffline;
   const QualityIcon = instruction ? QUALITY_ICON[instruction.quality] ?? Sparkles : Sparkles;
   const spacePhotos = spaces.length ? spaces[spaces.length - 1].photos : 0;
+  const roomDone = roomPoints.filter(pt => pt.status === 'done').length;
+  const roomStats = (name: string) => {
+    const r = roomsRef.current.get(normText(name));
+    return r ? { total: r.points.length, done: r.points.filter(pt => pt.status === 'done').length } : null;
+  };
 
   // ---------------------------------------------------------------- rendu : choix du mode de visite
   const setupScreen = (
@@ -980,16 +1487,34 @@ export const GuidedVisit: React.FC<Props> = ({
               <div className="text-xs text-slate-400">par consigne ({stats.frames} images)</div>
             </div>
           </div>
+          {doneElements.length > 0 && (
+            <div className="rounded-2xl bg-white/5 p-4" data-testid="elements-done">
+              <p className="text-xs uppercase tracking-wider text-slate-400 mb-2">Éléments relevés</p>
+              <ol className="space-y-1 text-sm">
+                {doneElements.map((d, i) => (
+                  <li key={`${d.title}-${i}`} className="flex justify-between gap-2">
+                    <span className="truncate">{d.title}{d.space ? <span className="text-slate-400"> · {d.space}</span> : null}</span>
+                    <span className="text-slate-400 shrink-0">{d.photos} photo{d.photos > 1 ? 's' : ''}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
           {spaces.length > 0 && (
             <div className="rounded-2xl bg-white/5 p-4">
               <p className="text-xs uppercase tracking-wider text-slate-400 mb-2">Espaces parcourus</p>
               <ol className="space-y-1 text-sm">
-                {spaces.map((s, i) => (
-                  <li key={`${s.name}-${i}`} className="flex justify-between gap-2">
-                    <span className="truncate">{i + 1}. {s.name}</span>
-                    <span className="text-slate-400 shrink-0">{s.photos} photo{s.photos > 1 ? 's' : ''}</span>
-                  </li>
-                ))}
+                {spaces.map((s, i) => {
+                  const rs = roomStats(s.name);
+                  return (
+                    <li key={`${s.name}-${i}`} className="flex justify-between gap-2">
+                      <span className="truncate">{i + 1}. {s.name}</span>
+                      <span className="text-slate-400 shrink-0">
+                        {rs && rs.total ? `${rs.done}/${rs.total} éléments · ` : ''}{s.photos} photo{s.photos > 1 ? 's' : ''}
+                      </span>
+                    </li>
+                  );
+                })}
               </ol>
             </div>
           )}
@@ -1021,9 +1546,14 @@ export const GuidedVisit: React.FC<Props> = ({
       />
       {flashKey > 0 && <div key={flashKey} className="absolute inset-0 bg-white pointer-events-none capture-flash" />}
 
-      {/* Surbrillance de l'élément visé (positionnée image par image) */}
-      <div ref={boxRef} className="ar-box" style={{ display: 'none' }} data-testid="ar-box">
-        <span ref={boxLabelRef} className="ar-label" />
+      {/* Repères des éléments repérés dans la pièce (positionnés image par image) */}
+      <div ref={pinsLayerRef} className="ar-pins" data-testid="ar-pins" />
+
+      {/* Repère sur l'élément visé (positionné image par image) */}
+      <div ref={boxRef} className="ar-pin" style={{ display: 'none' }} data-testid="ar-pin">
+        <span ref={boxLabelRef} className="ar-pin-label" />
+        <span className="ar-pin-head"><MapPin size={16} strokeWidth={2.5} /></span>
+        <span className="ar-pin-dot" />
       </div>
       <div ref={arrowRef} className="ar-arrow" style={{ display: 'none' }} data-testid="ar-arrow">
         <div ref={arrowIconRef} className="ar-arrow-icon"><Navigation size={20} style={{ transform: 'rotate(45deg)' }} /></div>
@@ -1031,7 +1561,7 @@ export const GuidedVisit: React.FC<Props> = ({
       </div>
 
       {/* Haut : fermer, mode, lampe, micro */}
-      <div className="absolute top-0 inset-x-0 bg-gradient-to-b from-black/80 via-black/40 to-transparent px-3 pb-6 safe-top">
+      <div className="absolute top-0 inset-x-0 z-10 bg-gradient-to-b from-black/80 via-black/40 to-transparent px-3 pb-6 safe-top">
         <div className="flex items-center gap-2">
           <button onClick={finishVisit} className="p-2.5 rounded-full bg-black/40 hover:bg-black/60" aria-label="Terminer la visite">
             <X size={22} />
@@ -1054,9 +1584,15 @@ export const GuidedVisit: React.FC<Props> = ({
           </button>
           {speechSupported && (
             <button
-              onClick={() => { setMicMsg(''); micErrorsRef.current = 0; setMicOn(m => !m); }}
-              className={`p-2.5 rounded-full ${micOn ? 'bg-rose-500' : 'bg-black/40'}`}
+              onClick={() => {
+                setMicMsg('');
+                micErrorsRef.current = 0;
+                if (!micOn) flashSpeechHint();
+                setMicOn(m => !m);
+              }}
+              className={`p-2.5 rounded-full ${micOn ? 'bg-rose-500 ring-2 ring-rose-300/60' : 'bg-black/40'}`}
               aria-label={micOn ? 'Couper la dictée' : 'Activer la dictée'}
+              data-testid="mic-toggle"
             >
               {micOn ? <Mic size={20} /> : <MicOff size={20} />}
             </button>
@@ -1106,23 +1642,61 @@ export const GuidedVisit: React.FC<Props> = ({
                 <p className="text-lg font-semibold">Je regarde où aller ensuite…</p>
               </div>
             ) : instruction ? (
-              <div key={instruction.key} className="guide-pop rounded-2xl bg-black/60 backdrop-blur-md border border-white/10 px-4 py-3 shadow-2xl" data-testid="guide-instruction">
-                <div className="flex items-start gap-3">
+              <div className="rounded-2xl bg-black/60 backdrop-blur-md border border-white/10 px-4 py-3 shadow-2xl" data-testid="guide-instruction">
+                {active && (
+                  <div className="mb-2" data-testid="step-bar">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-amber-200">
+                      <ListChecks size={14} className="shrink-0" />
+                      <span className="truncate">
+                        {active.title} · étape {active.stepIdx + 1}/{active.protocol.steps.length} — {active.protocol.steps[active.stepIdx].label}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 flex gap-1">
+                      {active.protocol.steps.map((st, i) => (
+                        <span
+                          key={st.key}
+                          className={`h-1.5 flex-1 rounded-full ${i < active.stepIdx ? 'bg-emerald-400' : i === active.stepIdx ? 'bg-amber-300' : 'bg-white/20'}`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div key={instruction.text} className="guide-pop flex items-start gap-3">
                   <QualityIcon size={22} className="text-blue-300 shrink-0 mt-1" />
                   <div className="min-w-0">
                     <p className="text-[22px] leading-tight font-bold">{instruction.text}</p>
                     {instruction.detail && <p className="mt-1 text-sm text-white/75">{instruction.detail}</p>}
                   </div>
                 </div>
-                {seenNow.length > 0 && (
+                {seenNow.length > 0 && !active && (
                   <p className="mt-2 text-xs text-emerald-200/90 truncate">Vu : {seenNow.join(' · ')}</p>
+                )}
+                {active && (
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      onClick={() => advanceStep('skip')}
+                      className="flex items-center gap-1 px-3 py-1.5 rounded-full bg-white/15 text-xs font-bold"
+                      data-testid="skip-step"
+                    >
+                      <SkipForward size={14} /> Passer l'étape
+                    </button>
+                    <button onClick={abandonElement} className="px-3 py-1.5 rounded-full bg-white/10 text-xs font-semibold text-white/80" data-testid="next-element">
+                      Autre élément
+                    </button>
+                  </div>
                 )}
               </div>
             ) : (
               <div className="rounded-2xl bg-black/50 backdrop-blur-md px-4 py-3 flex items-center gap-3">
                 <Loader2 size={20} className="animate-spin text-blue-300" />
                 <p className="text-lg font-semibold">
-                  {cameraState === 'ready' ? (mode === 'parcours' ? 'Je prépare le parcours…' : 'Je regarde où vous êtes…') : 'Ouverture de la caméra…'}
+                  {cameraState !== 'ready'
+                    ? 'Ouverture de la caméra…'
+                    : doneElements.length
+                      ? 'Je cherche l’élément suivant…'
+                      : mode === 'parcours'
+                        ? 'Je prépare le parcours…'
+                        : 'Je regarde où vous êtes…'}
                 </p>
               </div>
             )}
@@ -1131,7 +1705,7 @@ export const GuidedVisit: React.FC<Props> = ({
       </div>
 
       {/* Milieu : indications locales */}
-      <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 flex flex-col items-center gap-2 pointer-events-none px-6">
+      <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 z-10 flex flex-col items-center gap-2 pointer-events-none px-6">
         {pendingCapture && (
           <div className="px-4 py-2 rounded-full bg-white text-black font-bold text-base flex items-center gap-2 shadow-xl">
             <Hand size={18} /> Ne bougez plus…
@@ -1159,7 +1733,7 @@ export const GuidedVisit: React.FC<Props> = ({
       </div>
 
       {cameraState === 'error' && (
-        <div className="absolute inset-0 flex items-center justify-center p-6 bg-black/85">
+        <div className="absolute inset-0 z-20 flex items-center justify-center p-6 bg-black/85">
           <div className="max-w-sm text-center space-y-4">
             <AlertTriangle size={36} className="mx-auto text-amber-400" />
             <p className="font-semibold">{cameraError}</p>
@@ -1172,12 +1746,40 @@ export const GuidedVisit: React.FC<Props> = ({
       )}
 
       {/* Bas : dictée, espace, photos, commandes */}
-      <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/85 via-black/50 to-transparent pt-10 safe-bottom">
-        {(interim || lastSpoken || micMsg) && (
-          <p className="px-4 mb-2 text-sm text-white/85 italic truncate">
-            {micMsg ? micMsg : `« ${interim || lastSpoken} »`}
-          </p>
+      <div className="absolute bottom-0 inset-x-0 z-10 bg-gradient-to-t from-black/85 via-black/50 to-transparent pt-10 safe-bottom">
+        {speechHint && !offline && (
+          <div className="mx-4 mb-2 rounded-xl bg-rose-600/90 px-3 py-2 guide-pop" data-testid="speech-hint">
+            {micOn ? (
+              <>
+                <p className="text-sm font-bold flex items-center gap-1.5"><Mic size={15} className="shrink-0" /> Vous pouvez parler pendant la visite</p>
+                <p className="text-xs text-white/90 mt-0.5">
+                  « fenêtre de 1985 », « parquet chêne massif », « pas de store ici »… Vos précisions guident l'IA et sont jointes aux photos.
+                </p>
+              </>
+            ) : (
+              <p className="text-sm font-semibold flex items-center gap-1.5">
+                <MicOff size={15} className="shrink-0" />
+                {speechSupported ? 'Dictée coupée : touchez le micro en haut pour parler à l’IA.' : 'Dictée vocale non disponible sur ce navigateur.'}
+              </p>
+            )}
+          </div>
         )}
+        {micMsg ? (
+          <p className="px-4 mb-2 text-sm text-amber-200 truncate">{micMsg}</p>
+        ) : micOn && !paused ? (
+          <div className="px-4 mb-2 flex items-center gap-2 text-sm min-w-0" data-testid="mic-status">
+            <span className="listen-dot shrink-0" />
+            <span className="font-semibold text-rose-200 shrink-0">À l'écoute</span>
+            <span className="truncate italic text-white/85">
+              {interim ? `« ${interim} »` : lastSpoken ? `« ${lastSpoken} »` : 'parlez pour préciser'}
+            </span>
+            {!interim && lastSpoken && (
+              <span className={`shrink-0 text-xs font-semibold ${spokenSent ? 'text-emerald-300' : 'text-white/60'}`}>
+                {spokenSent ? 'transmis ✓' : 'envoi…'}
+              </span>
+            )}
+          </div>
+        ) : null}
         {toast && (
           <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-emerald-500/90 text-black text-sm font-semibold truncate" data-testid="guided-toast">{toast}</div>
         )}
@@ -1189,11 +1791,21 @@ export const GuidedVisit: React.FC<Props> = ({
         )}
 
         <div className="flex items-center gap-2 px-4 mb-3">
-          <span className="min-w-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/50 text-sm font-semibold" data-testid="space-chip">
+          <button
+            onClick={() => setRoomListOpen(true)}
+            className="min-w-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/50 text-sm font-semibold text-left"
+            data-testid="space-chip"
+          >
             <MapPin size={14} className="shrink-0 text-blue-300" />
             <span className="truncate">{currentSpace || 'Lieu en cours d’identification'}</span>
-            {currentSpace && <span className="text-white/60 font-normal shrink-0">· {spacePhotos} photo{spacePhotos > 1 ? 's' : ''}</span>}
-          </span>
+            {roomPoints.length > 0 ? (
+              <span className="shrink-0 flex items-center gap-1 text-emerald-300" data-testid="room-count">
+                · <ListChecks size={13} /> {roomDone}/{roomPoints.length}
+              </span>
+            ) : currentSpace ? (
+              <span className="text-white/60 font-normal shrink-0">· {spacePhotos} photo{spacePhotos > 1 ? 's' : ''}</span>
+            ) : null}
+          </button>
           <button
             onClick={askNextSpace}
             disabled={askingNext || offline || cameraState !== 'ready'}
@@ -1250,6 +1862,57 @@ export const GuidedVisit: React.FC<Props> = ({
           {captures.length} photo{captures.length > 1 ? 's' : ''} · {doneCount} analysée{doneCount > 1 ? 's' : ''}
         </p>
       </div>
+
+      {roomListOpen && (
+        <div className="absolute inset-0 z-30 flex flex-col justify-end bg-black/40" onClick={() => setRoomListOpen(false)}>
+          <div
+            className="rounded-t-3xl bg-slate-950/95 backdrop-blur-md border-t border-white/10 px-4 pt-4 pb-4 safe-bottom max-h-[65vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+            data-testid="room-list"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1">
+              <p className="font-bold text-lg truncate">{currentSpace || 'Pièce actuelle'}</p>
+              <button onClick={() => setRoomListOpen(false)} className="p-2 rounded-full bg-white/10 shrink-0" aria-label="Fermer la liste">
+                <X size={18} />
+              </button>
+            </div>
+            <p className="text-xs text-white/60 mb-3">
+              {roomPoints.length
+                ? `${roomDone}/${roomPoints.length} éléments faits · touchez un élément pour le relever maintenant`
+                : 'Rien de repéré pour l’instant : filmez la pièce, les repères apparaissent au fur et à mesure.'}
+            </p>
+            <ul className="space-y-1.5">
+              {roomPoints.map(pt => {
+                const isActive = pt.status === 'active';
+                return (
+                  <li key={pt.id}>
+                    <button
+                      onClick={() => choosePoint(pt.id, true)}
+                      disabled={isActive}
+                      className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left ${isActive ? 'bg-amber-400/20 border border-amber-300/50' : 'bg-white/5 hover:bg-white/10'}`}
+                      data-testid="room-item"
+                      data-status={pt.status}
+                    >
+                      <span
+                        className={`w-6 h-6 rounded-full shrink-0 flex items-center justify-center text-xs font-black border-2 border-white ${pt.status === 'done' ? 'bg-emerald-500' : pt.status === 'skipped' ? 'bg-slate-400' : 'bg-amber-400 text-slate-900'}`}
+                      >
+                        {pt.status === 'done' ? '✓' : pt.status === 'skipped' ? '–' : ''}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-semibold truncate">{pt.label}</span>
+                        {!sameText(pt.element, pt.label) && <span className="block text-xs text-white/55 truncate">{pt.element || pt.category}</span>}
+                      </span>
+                      <span className="shrink-0 text-xs text-white/60">
+                        {isActive ? 'en cours' : pt.status === 'done' ? `${pt.photos} photo${pt.photos > 1 ? 's' : ''} · refaire` : pt.status === 'skipped' ? 'passé · reprendre' : 'à faire'}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {showSetup && setupScreen}
     </div>

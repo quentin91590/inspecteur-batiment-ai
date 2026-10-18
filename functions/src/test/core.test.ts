@@ -172,12 +172,89 @@ describe('guidage spatial et surbrillance', () => {
     assert.equal(res.guide?.targetDirection, 'inconnu');
   });
 
+  it('séquence par élément : étape en cours transmise, champs étape absente / élément suivant lus', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply({ ...GUIDE_OK, capture: false, stepAbsent: true, nextCategory: '', nextElement: '' });
+    const res = await handleAiRequest(
+      {
+        task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [],
+        element: 'Fenêtre', elementCategory: 'Fenêtres', step: 'Protection solaire', stepIndex: 4, stepCount: 6,
+        stepAim: 'store, volet, lamelles ou caisson', stepOptional: true, nextSteps: ['Défauts'], elementsDoneHere: ['Radiateur'],
+      },
+      'u1', deps(),
+    );
+    const text = captured[0].body.contents[0].parts[1].text as string;
+    assert.match(text, /ÉLÉMENT EN COURS : Fenêtre \[Fenêtres\]/);
+    assert.match(text, /Étape en cours \(étape 5\/6\) : Protection solaire \(facultative\)/);
+    assert.match(text, /La photo doit montrer : store, volet/);
+    assert.match(text, /Éléments déjà faits dans cet espace : Radiateur/);
+    assert.equal(res.guide?.stepAbsent, true);
+  });
+
+  it('sans élément en cours : l’IA propose le prochain élément', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply({ ...GUIDE_OK, nextCategory: 'Chauffage', nextElement: 'Emetteur', stepAbsent: false });
+    const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [] }, 'u1', deps());
+    assert.match(captured[0].body.contents[0].parts[1].text, /AUCUN ÉLÉMENT EN COURS/);
+    assert.equal(res.guide?.nextCategory, 'Chauffage');
+    assert.equal(res.guide?.nextElement, 'Emetteur');
+  });
+
   it('cadres : échelle 0-1 corrigée, cadres incohérents rejetés', () => {
     assert.deepEqual(normalizeBox([0.1, 0.2, 0.5, 0.6]), [100, 200, 500, 600]);
     assert.deepEqual(normalizeBox([100, 200, 500, 1200]), [100, 200, 500, 1000]);
     assert.deepEqual(normalizeBox([500, 200, 100, 600]), []);
     assert.deepEqual(normalizeBox([1, 2, 3]), []);
     assert.deepEqual(normalizeBox('x'), []);
+  });
+
+  it('repérage : éléments visibles normalisés, libellés déjà repérés transmis, élément en cours n’empêche pas le repérage', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply({
+      ...GUIDE_OK,
+      elements: [
+        { category: 'Chauffage', element: 'Boiler', label: 'Boiler blanc', box: [0.1, 0.2, 0.5, 0.6] },
+        { category: 'Chauffage', element: 'Production de chaleur', label: '', box: [100, 100, 300, 300] },
+        { category: 'Chauffage', element: 'Boiler', label: 'Cadre faux', box: [500, 200, 100, 600] },
+        { category: '', element: 'Boiler', label: 'Sans catégorie', box: [100, 100, 300, 300] },
+        'nimporte quoi',
+      ],
+    });
+    const res = await handleAiRequest(
+      {
+        task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [],
+        element: 'Chaudière gaz', elementCategory: 'Chauffage', step: 'Plaque signalétique',
+        spotted: ['Chaudière gaz', 'Boiler blanc'], elementsDoneHere: ['Radiateur fonte'],
+      },
+      'u1', deps(),
+    );
+    const text = captured[0].body.contents[0].parts[1].text as string;
+    assert.match(text, /Déjà repérés dans cet espace : Chaudière gaz, Boiler blanc/);
+    assert.match(text, /Éléments déjà faits dans cet espace : Radiateur fonte/);
+    assert.doesNotMatch(text, /AUCUN ÉLÉMENT EN COURS/);
+    assert.match(captured[0].body.systemInstruction.parts[0].text, /REPÉRAGE DES ÉLÉMENTS \(à CHAQUE image/);
+    assert.deepEqual(res.guide?.elements, [
+      { category: 'Chauffage', element: 'Boiler', label: 'Boiler blanc', box: [100, 200, 500, 600] },
+      { category: 'Chauffage', element: 'Production de chaleur', label: 'Production de chaleur', box: [100, 100, 300, 300] },
+    ]);
+  });
+
+  it('en route vers la pièce suivante : guidage vers elle, aucun élément proposé', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply(GUIDE_OK);
+    await handleAiRequest(
+      { task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [], currentSpace: 'Chambre', goingTo: 'Couloir' },
+      'u1', deps(),
+    );
+    const text = captured[0].body.contents[0].parts[1].text as string;
+    assert.match(text, /SE REND VERS : Couloir/);
+    assert.doesNotMatch(text, /AUCUN ÉLÉMENT EN COURS/);
+  });
+
+  it('réponse sans liste d’éléments → liste vide', async () => {
+    nextReply = () => geminiReply({ ...GUIDE_OK, elements: undefined });
+    const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [] }, 'u1', deps());
+    assert.deepEqual(res.guide?.elements, []);
   });
 
   it('élément hors image : direction conservée, pas de cadre', async () => {

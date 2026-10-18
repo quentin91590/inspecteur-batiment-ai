@@ -58,6 +58,24 @@ export const GUIDE_SCHEMA: JsonSchema = {
       items: { type: 'integer' },
     },
     targetDirection: { type: 'string', enum: ['ici', 'gauche', 'droite', 'haut', 'bas', 'derriere', 'inconnu'] },
+    stepAbsent: { type: 'boolean', description: 'true si l’étape facultative en cours n’existe pas ici' },
+    nextCategory: { type: 'string', description: 'Sans élément en cours : catégorie exacte du prochain élément, sinon chaîne vide' },
+    nextElement: { type: 'string', description: 'Sans élément en cours : élément exact du référentiel, sinon chaîne vide' },
+    elements: {
+      type: 'array',
+      description: 'Tous les éléments du référentiel visibles, une entrée par variante distincte (10 maximum)',
+      items: {
+        type: 'object',
+        properties: {
+          category: { type: 'string' },
+          element: { type: 'string' },
+          label: { type: 'string', description: 'Libellé court qui distingue la variante (« Parquet chêne », « Peinture blanche »)' },
+          box: { type: 'array', items: { type: 'integer' }, description: '[ymin, xmin, ymax, xmax] de 0 à 1000' },
+        },
+        required: ['category', 'element', 'label', 'box'],
+        additionalProperties: false,
+      },
+    },
     seen: {
       type: 'array',
       description: 'Éléments du référentiel clairement visibles sur l’image',
@@ -72,7 +90,7 @@ export const GUIDE_SCHEMA: JsonSchema = {
       },
     },
   },
-  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'space', 'spaceDone', 'nextSpace', 'targetBox', 'targetDirection', 'seen'],
+  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'space', 'spaceDone', 'nextSpace', 'targetBox', 'targetDirection', 'stepAbsent', 'nextCategory', 'nextElement', 'elements', 'seen'],
   additionalProperties: false,
 };
 

@@ -234,6 +234,21 @@ export function normalizeGuide(parsed: unknown): GuideResult {
     nextSpace: clip(g.nextSpace, 80),
     targetBox,
     targetDirection: targetBox.length ? 'ici' : DIRECTIONS.includes(direction) ? direction : 'inconnu',
+    stepAbsent: g.stepAbsent === true || g.stepAbsent === 'true',
+    nextCategory: clip(g.nextCategory, 80),
+    nextElement: clip(g.nextElement, 120),
+    elements: Array.isArray(g.elements)
+      ? (g.elements as any[])
+          .filter(e => e && e.category && (e.label || e.element))
+          .slice(0, 12)
+          .map(e => ({
+            category: clip(e.category, 80),
+            element: clip(e.element, 120),
+            label: clip(e.label || e.element, 60),
+            box: normalizeBox(e.box),
+          }))
+          .filter(e => e.box.length === 4)
+      : [],
   };
 }
 
@@ -305,6 +320,17 @@ export async function handleAiRequest(data: unknown, uid: string, deps: CoreDeps
           transcript: str(req.transcript, 'transcript', 1500, false),
           lastInstruction: str(req.lastInstruction, 'lastInstruction', 200, false),
           lastTarget: str(req.lastTarget, 'lastTarget', 200, false),
+          element: str(req.element, 'element', 120, false),
+          elementCategory: str(req.elementCategory, 'elementCategory', 120, false),
+          step: str(req.step, 'step', 120, false),
+          stepIndex: typeof req.stepIndex === 'number' ? req.stepIndex : undefined,
+          stepCount: typeof req.stepCount === 'number' ? req.stepCount : undefined,
+          stepAim: str(req.stepAim, 'stepAim', 300, false),
+          stepOptional: req.stepOptional === true,
+          nextSteps: strList(req.nextSteps, 10),
+          elementsDoneHere: strList(req.elementsDoneHere, 30),
+          spotted: strList(req.spotted, 40),
+          goingTo: str(req.goingTo, 'goingTo', 80, false),
         }),
         imageB64: image(req.image),
         schema: GUIDE_SCHEMA,

@@ -23,39 +23,149 @@
 /* Évite qu'un élément trop large n'élargisse l'écran sur mobile (et ne décale la visite guidée) */
 html, body { overflow-x: hidden; }
 
-/* Surbrillance de l'élément visé (visite guidée) */
-.ar-box {
+/* Repère posé sur l'élément visé (visite guidée) : petit, il suit l'élément en direct */
+.ar-pin {
   position: absolute;
   left: 0;
   top: 0;
-  border: 3px solid #facc15;
-  border-radius: 16px;
-  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35), 0 0 28px rgba(250, 204, 21, 0.55), inset 0 0 18px rgba(250, 204, 21, 0.25);
-  pointer-events: none;
+  width: 1px;
+  height: 1px;
   z-index: 5;
+  pointer-events: none;
   will-change: transform;
-  animation: ar-pulse 1.4s ease-in-out infinite;
 }
-.ar-box.ar-weak { border-style: dashed; opacity: 0.7; animation: none; }
-.ar-label {
+.ar-pin-dot {
   position: absolute;
-  left: -3px;
-  bottom: calc(100% + 6px);
-  max-width: 70vw;
+  left: -7px;
+  top: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: #facc15;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
+.ar-pin-dot::after {
+  content: '';
+  position: absolute;
+  inset: -9px;
+  border-radius: 999px;
+  border: 2px solid rgba(250, 204, 21, 0.9);
+  animation: ar-ping 1.3s ease-out infinite;
+}
+.ar-pin-head {
+  position: absolute;
+  left: -15px;
+  top: -44px;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px 999px 999px 4px;
+  transform: rotate(-45deg);
+  background: #facc15;
+  color: #111827;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+.ar-pin-head svg { transform: rotate(45deg); }
+.ar-pin-label {
+  position: absolute;
+  left: 0;
+  top: -72px;
+  transform: translateX(-50%);
+  max-width: 52vw;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  background: #facc15;
-  color: #111827;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
   font-weight: 700;
-  font-size: 13px;
-  padding: 3px 9px;
+  font-size: 12px;
+  padding: 2px 8px;
   border-radius: 999px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
 }
-@keyframes ar-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(0,0,0,.35), 0 0 18px rgba(250,204,21,.45), inset 0 0 12px rgba(250,204,21,.2); }
-  50% { box-shadow: 0 0 0 2px rgba(0,0,0,.35), 0 0 34px rgba(250,204,21,.8), inset 0 0 22px rgba(250,204,21,.35); }
+.ar-pin.ar-weak { opacity: 0.55; }
+.ar-pin.ar-weak .ar-pin-dot::after { animation: none; }
+/* Repères des éléments repérés dans la pièce : jaune = à faire, vert = fait, gris = passé */
+.ar-pins {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+.ar-mini {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  will-change: transform;
+}
+.ar-mini-dot {
+  position: absolute;
+  left: -11px;
+  top: -11px;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.ar-mini-dot::before {
+  /* zone de toucher plus large que le point */
+  content: '';
+  position: absolute;
+  inset: -12px;
+  border-radius: 999px;
+}
+.ar-mini-label {
+  position: absolute;
+  left: 15px;
+  top: -10px;
+  max-width: 34vw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.ar-mini.ar-todo .ar-mini-dot { background: #facc15; color: #111827; }
+.ar-mini.ar-done .ar-mini-dot { background: #22c55e; color: #fff; }
+.ar-mini.ar-done .ar-mini-label { background: rgba(21, 128, 61, 0.75); }
+.ar-mini.ar-skipped .ar-mini-dot { background: #94a3b8; color: #fff; }
+.ar-mini.ar-skipped { opacity: 0.75; }
+.ar-mini.ar-edge .ar-mini-dot { left: -7px; top: -7px; width: 14px; height: 14px; border-width: 2px; font-size: 0; }
+.ar-mini.ar-edge .ar-mini-label { display: none; }
+.ar-mini.ar-edge { opacity: 0.85; }
+.listen-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #fb7185;
+  animation: listen-pulse 1.2s ease-in-out infinite;
+}
+@keyframes listen-pulse {
+  0%, 100% { transform: scale(0.8); opacity: 0.6; }
+  50% { transform: scale(1.25); opacity: 1; }
+}
+@keyframes ar-ping {
+  0% { transform: scale(0.6); opacity: 1; }
+  100% { transform: scale(1.8); opacity: 0; }
 }
 .ar-arrow {
   position: absolute;

@@ -4,7 +4,11 @@ import type { AiRequest, AiResponse, ModelInfo, RawElement, SchemaDefinition } f
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 let guideCounter = 0;
+let stepCalls = 0;
+let lastStep = '';
 let analyzeCounter = 0;
+let demoSpace = ''; // pièce simulée après « Pièce suivante »
+const DEMO_SPACES = ['Couloir (démo)', 'Cuisine (démo)', 'Salle de bain (démo)'];
 
 export const DEMO_MODEL_ID = 'demo:simulation';
 
@@ -29,6 +33,24 @@ function pickValue(values: string[], seed: number): string {
 function parseMissingLine(line: string): { category: string; subCategory: string } | null {
   const m = line.match(/^(.+?) : (.+?) \(/);
   return m ? { category: m[1].trim(), subCategory: m[2].trim() } : null;
+}
+
+/** Éléments « visibles » simulés : les trois premiers éléments à relever, à des positions fixes de l'image. */
+const DEMO_BOXES = [[300, 250, 620, 750], [380, 40, 640, 220], [80, 760, 320, 960]];
+function demoElements(missing: string[], done: string[]) {
+  const names: { category: string; element: string }[] = [];
+  for (const line of missing) {
+    const m = line.match(/^(.+?) : (.+)$/);
+    if (!m) continue;
+    for (const part of m[2].split(/\),\s*/)) {
+      const el = part.split(' (')[0].trim();
+      if (el) names.push({ category: m[1].trim(), element: el });
+    }
+  }
+  return names
+    .slice(0, 3)
+    .map((n, i) => ({ ...n, label: n.element, box: DEMO_BOXES[i] }))
+    .filter(e => !done.includes(e.label));
 }
 
 function allEntries(schema: SchemaDefinition) {
@@ -65,7 +87,7 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
       return { models: MOCK_MODELS, defaults: { analyze: DEMO_MODEL_ID, text: DEMO_MODEL_ID, guide: DEMO_MODEL_ID } };
 
     case 'guide': {
-      await wait(450 + Math.random() * 350);
+      await wait(350 + Math.random() * 300);
       guideCounter++;
       const base = {
         detail: 'Consignes simulées (mode démo)',
@@ -76,37 +98,63 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
         nextSpace: '',
         targetBox: [] as number[],
         targetDirection: 'inconnu' as const,
+        stepAbsent: false,
+        nextCategory: '',
+        nextElement: '',
+        elements: demoElements(req.missing, req.elementsDoneHere ?? []),
       };
-      const space = req.currentSpace || 'Pièce (démo)';
+      if (!req.currentSpace && !(req.spacesVisited ?? []).length) demoSpace = ''; // nouvelle visite
+      const space = demoSpace || req.currentSpace || 'Pièce (démo)';
       if (req.mode === 'parcours' && !(req.spacesVisited ?? []).length && !req.currentSpace) {
         return { guide: { ...base, instruction: 'Placez-vous face à l’entrée principale, côté rue', target: 'Façade — entrée principale', capture: false, space: 'Abords' }, meta: meta() };
       }
       if (req.requestNextSpace) {
+        const next = DEMO_SPACES[(DEMO_SPACES.indexOf(demoSpace) + 1) % DEMO_SPACES.length];
+        demoSpace = next; // les images suivantes montrent la nouvelle pièce
         return {
-          guide: { ...base, instruction: 'Passez dans le couloir voisin', target: '', capture: false, space, spaceDone: true, nextSpace: 'Couloir (démo)', targetDirection: 'droite' },
+          guide: { ...base, elements: [], instruction: `Passez dans : ${next.replace(' (démo)', '').toLowerCase()}`, target: '', capture: false, space, spaceDone: true, nextSpace: next, targetDirection: 'droite' },
           meta: meta(),
         };
       }
-      const target = req.missing.map(parseMissingLine).find(e => e && !req.inProgress.some(t => t.startsWith(e.subCategory)));
+      if (req.goingTo && !req.element) {
+        return { guide: { ...base, instruction: `Avancez vers : ${req.goingTo.replace(' (démo)', '').toLowerCase()}`, target: '', capture: false, space }, meta: meta() };
+      }
+      // Séquence en cours : étape facultative « absente », sinon photo à la 2e image stable
+      if (req.element) {
+        const absent = !!req.stepOptional;
+        stepCalls = req.step === lastStep ? stepCalls + 1 : 1;
+        lastStep = req.step ?? '';
+        const ready = !absent && stepCalls >= 2;
+        return {
+          guide: {
+            ...base,
+            instruction: ready ? 'Ne bougez plus' : `Cadrez : ${(req.step ?? '').toLowerCase()}`,
+            target: `${req.element} — ${req.step}`,
+            capture: ready,
+            stepAbsent: absent,
+            space,
+            targetBox: [320, 300, 600, 700],
+            targetDirection: 'ici',
+          },
+          meta: meta(),
+        };
+      }
+      const target = req.missing.map(parseMissingLine).find(e => e && !(req.elementsDoneHere ?? []).some(d => d.toLowerCase().includes(e.subCategory.toLowerCase())));
       if (!target) {
         return {
           guide: { ...base, instruction: 'Pièce terminée : passez à la suivante', target: '', capture: false, space, spaceDone: true, nextSpace: 'Couloir (démo)' },
           meta: meta(),
         };
       }
-      const step = guideCounter % 3;
-      const capture = step === 0;
-      const label = target.subCategory.toLowerCase();
-      const instruction = capture ? `Ne bougez plus : photo de ${label}` : step === 1 ? `Montrez-moi ${label}` : `Approchez-vous de ${label}`;
       return {
         guide: {
           ...base,
-          instruction,
-          target: `${target.subCategory} — vue d’ensemble`,
-          capture,
-          captureReason: capture ? 'Élément bien cadré' : '',
-          seen: capture ? [target] : [],
+          instruction: `Montrez ${target.subCategory.toLowerCase()}`,
+          target: target.subCategory,
+          capture: false,
           space,
+          nextCategory: target.category,
+          nextElement: target.subCategory,
           targetBox: [300, 250, 620, 750],
           targetDirection: 'ici',
         },

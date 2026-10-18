@@ -35,6 +35,9 @@ export type ARState =
 
 const DEG = Math.PI / 180;
 const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+/** Angle (degrés) entre deux directions. */
+export const angleBetween = (a: Vec3, b: Vec3): number => Math.acos(Math.min(1, Math.max(-1, dot(a, b)))) / DEG;
 const add = (a: Vec3, b: Vec3, k = 1): Vec3 => [a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k];
 const scale = (a: Vec3, k: number): Vec3 => [a[0] * k, a[1] * k, a[2] * k];
 const norm = (a: Vec3): Vec3 => {
@@ -261,6 +264,16 @@ export class TargetTracker {
     this.dir = poseAtCapture ? unproject(box.cx, box.cy, poseAtCapture, fieldOfView(video.w, video.h)) : null;
     if (frameAtCapture) this.matcher.setFrom(frameAtCapture, box);
     else this.matcher.clear();
+  }
+
+  /** Vise un élément déjà repéré (direction connue au gyroscope, ou position dans l'image). */
+  setKnown(label: string, dir: Vec3 | null, box: NormBox | null): void {
+    this.clear();
+    this.label = label;
+    this.dir = dir;
+    this.box = box ? { ...box } : { cx: 0.5, cy: 0.5, w: 0.1, h: 0.1 };
+    this.lastSeenAt = dir ? Date.now() : box ? Date.now() : 0;
+    if (!dir && !box) this.box = null;
   }
 
   /** Pas de cadre (élément hors image) : simple indication de direction. */

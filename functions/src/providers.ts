@@ -85,7 +85,7 @@ async function generateGemini(p: GenerateParams, keys: ProviderKeys): Promise<Ge
         systemInstruction: p.system,
         ...(p.schema ? { responseMimeType: 'application/json', responseJsonSchema: forGemini(p.schema) } : {}),
         ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
-        ...(p.speed === 'fast' ? { maxOutputTokens: 1024, temperature: 0.2 } : {}),
+        ...(p.speed === 'fast' ? { maxOutputTokens: 1536, temperature: 0.2 } : {}),
       },
     });
     const usage = response.usageMetadata;
@@ -129,7 +129,7 @@ async function generateAnthropic(p: GenerateParams, keys: ProviderKeys): Promise
   try {
     const response = await client.messages.create({
       model: p.model,
-      max_tokens: p.speed === 'fast' ? 800 : 4096,
+      max_tokens: p.speed === 'fast' ? 1500 : 4096,
       // Le système (règles + référentiel) est identique d'un appel à l'autre : mis en cache.
       system: [{ type: 'text', text: p.system, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content }],
@@ -180,7 +180,7 @@ async function generateOpenAiCompatible(p: GenerateParams, keys: ProviderKeys): 
       { role: 'system', content: system },
       { role: 'user', content: userContent },
     ],
-    max_tokens: p.speed === 'fast' ? 800 : 4096,
+    max_tokens: p.speed === 'fast' ? 1500 : 4096,
     temperature: 0.2,
     ...(p.schema ? { response_format: { type: 'json_object' } } : {}),
   };
