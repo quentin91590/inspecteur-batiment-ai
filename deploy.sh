@@ -23,7 +23,9 @@ fi
 echo "▶ Préparation de la fonction…"
 (cd functions && npm ci --no-audit --no-fund >/dev/null)
 
-if firebase functions:secrets:get GEMINI_API_KEY --project "$PROJECT" >/dev/null 2>&1; then
+# La clé n'est considérée comme enregistrée que si elle a une valeur active (une saisie interrompue crée un secret vide)
+HAS_KEY="$(gcloud secrets versions list GEMINI_API_KEY --project "$PROJECT" --filter="state=ENABLED" --format="value(name)" --limit=1 2>/dev/null || true)"
+if [ -n "$HAS_KEY" ]; then
   echo "▶ Clé Gemini déjà enregistrée (pour la remplacer : firebase functions:secrets:set GEMINI_API_KEY)."
 else
   echo "▶ Collez votre clé Gemini puis Entrée (elle ne s'affiche pas à l'écran) :"
