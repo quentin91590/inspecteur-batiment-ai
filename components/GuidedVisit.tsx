@@ -43,6 +43,8 @@ const MAX_POINTS = 30;            // repères par pièce
 const SAME_DIR_DEG = 12;          // même élément signalé sous un autre nom s'il est dans la même direction
 const RECENT_BOX_MS = 2500;       // sans gyroscope, un repère n'est affiché que peu après avoir été vu
 const SPEECH_HINT_MS = 9000;
+const MAX_DIGITAL_ZOOM = 4;       // zoom numérique (recadrage) quand le téléphone ne pilote pas le zoom
+const MAX_HW_ZOOM = 10;
 const RETAKE_OFFER_MS = 25000;    // proposition de reprendre une photo refusée d'un élément déjà fini
 const AUTO_CAPTURE_KEY = 'inspecteur.guided.autoCapture';
 const LEAVING_MS = 45000;         // après « Pièce suivante », on ne ramène pas l'inspecteur dans la pièce quittée
@@ -178,6 +180,20 @@ const HINT_VECTOR: Record<string, [number, number]> = {
 
 /** [ymin, xmin, ymax, xmax] (0-1000) → cadre normalisé (0-1) */
 const boxFromArray = (b: number[]): NormBox => ({ cx: (b[1] + b[3]) / 2000, cy: (b[0] + b[2]) / 2000, w: (b[3] - b[1]) / 1000, h: (b[2] - b[0]) / 1000 });
+/** Cadre lu sur une image recadrée (zoom numérique d) → cadre dans l'image vidéo complète. */
+const uncrop = (b: NormBox, d: number): NormBox =>
+  d <= 1.001 ? b : { cx: 0.5 + (b.cx - 0.5) / d, cy: 0.5 + (b.cy - 0.5) / d, w: b.w / d, h: b.h / d };
+const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** Zoom de la caméra : matériel si le téléphone le permet (meilleure netteté), sinon numérique. */
+interface ZoomState {
+  hw: number;
+  hwTarget?: number;
+  hwCaps: { min: number; max: number } | null;
+  digital: number;
+  applying: boolean;
+}
+
 const normText = (s: string) => s.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
 const readAutoCapture = () => {
@@ -242,6 +258,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const [autoCapture, setAutoCapture] = useState(readAutoCapture);
   const [ready, setReady] = useState(false);
   const [checks, setChecks] = useState<Record<string, CheckStatus>>({});
+  const [zoomShown, setZoomShown] = useState(1);
   const [refusedCaptures, setRefusedCaptures] = useState<string[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [sheetPointId, setSheetPointId] = useState<string | null>(null);
@@ -295,6 +312,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const pinElsRef = useRef(new Map<string, HTMLDivElement>());
   const onPinTapRef = useRef<(id: string) => void>(() => undefined);
   const chipsRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef<ZoomState>({ hw: 1, hwCaps: null, digital: 1, applying: false });
   const roomsRef = useRef(new Map<string, RoomState>());
 
   const prevSmallRef = useRef<Uint8ClampedArray | null>(null);
@@ -316,7 +334,9 @@ export const GuidedVisit: React.FC<Props> = ({
   const requestNextRef = useRef(false);
   const spaceCandidateRef = useRef<{ name: string; count: number } | null>(null);
   // Éléments vus pendant qu'un changement de pièce n'est pas encore confirmé : rangés une fois la pièce connue
-  const deferredRef = useRef<{ elements: VisibleElement[]; pose: ReturnType<OrientationSource['pose']>; dims: { w: number; h: number } }[]>([]);
+  const deferredRef = useRef<
+    { elements: VisibleElement[]; pose: ReturnType<OrientationSource['pose']>; dims: { w: number; h: number }; zoom: { hw: number; d: number } }[]
+  >([]);
   // « Pièce suivante » : en route vers une autre pièce
   const leavingRef = useRef<{ from: string; to: string; until: number } | null>(null);
   // Parcours guidé : espace où l'IA a commencé les relevés (avant, elle guide vers le point de départ)
@@ -345,8 +365,77 @@ export const GuidedVisit: React.FC<Props> = ({
     const video = videoRef.current;
     if (video) {
       video.srcObject = stream;
+      video.style.transform = '';
       void video.play().catch(() => undefined);
     }
+    // Nouveau flux : zoom remis à 1× ; zoom matériel s'il est proposé par la caméra
+    const track = stream.getVideoTracks()[0];
+    const caps: any = track?.getCapabilities?.() ?? {};
+    const settings: any = track?.getSettings?.() ?? {};
+    const hasHw = caps.zoom && typeof caps.zoom.max === 'number' && caps.zoom.max > Math.max(1, caps.zoom.min ?? 1) + 0.05;
+    zoomRef.current = {
+      hw: typeof settings.zoom === 'number' ? settings.zoom : 1,
+      hwCaps: hasHw ? { min: Math.max(1, caps.zoom.min ?? 1), max: Math.min(MAX_HW_ZOOM, caps.zoom.max) } : null,
+      digital: 1,
+      applying: false,
+    };
+    setZoomShown(zoomRef.current.hw);
+  };
+
+  /** Contraintes de la caméra en gardant le zoom et la lampe en cours (une contrainte remplace les précédentes). */
+  const withCurrent = (c: Record<string, unknown>): Record<string, unknown> => {
+    const zr = zoomRef.current;
+    return {
+      ...(zr.hwCaps ? { zoom: zr.hwTarget ?? zr.hw } : {}),
+      ...(lightRef.current === 'torch' ? { torch: true } : {}),
+      ...c,
+    };
+  };
+
+  /** Zoom demandé (pincement ou pastille) : facteur 1 à max. */
+  const setZoom = useCallback((zoom: number) => {
+    const z = zoom < 1.05 ? 1 : zoom; // presque 1× : on revient exactement à 1×
+    const zr = zoomRef.current;
+    if (zr.hwCaps) {
+      const value = Math.round(clampNum(z, zr.hwCaps.min, zr.hwCaps.max) * 100) / 100;
+      zr.hwTarget = value;
+      setZoomShown(value);
+      if (zr.applying) return;
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (!track) return;
+      zr.applying = true;
+      void (async () => {
+        try {
+          // On suit le doigt : on applique la dernière valeur demandée tant qu'elle change
+          while (zr.hwTarget !== undefined && Math.abs(zr.hwTarget - zr.hw) > 0.01) {
+            const target = zr.hwTarget;
+            await track.applyConstraints({
+              advanced: [{ zoom: target, ...(lightRef.current === 'torch' ? { torch: true } : {}) } as any],
+            });
+            const actual = (track.getSettings?.() as any)?.zoom;
+            zr.hw = typeof actual === 'number' ? actual : target;
+          }
+        } catch {
+          // Zoom refusé par la caméra : on passe au zoom numérique
+          zr.hwCaps = null;
+          zr.hw = 1;
+        } finally {
+          zr.applying = false;
+        }
+      })();
+      return;
+    }
+    const d = clampNum(z, 1, MAX_DIGITAL_ZOOM);
+    zr.digital = d;
+    const video = videoRef.current;
+    if (video) video.style.transform = d > 1.001 ? `scale(${d})` : '';
+    setZoomShown(d);
+  }, []);
+  const setZoomRef = useRef(setZoom);
+  setZoomRef.current = setZoom;
+  const currentZoom = () => {
+    const zr = zoomRef.current;
+    return zr.hwCaps ? zr.hwTarget ?? zr.hw : zr.digital;
   };
 
   const startCamera = useCallback(async () => {
@@ -375,7 +464,7 @@ export const GuidedVisit: React.FC<Props> = ({
   // ---------------------------------------------------------------- lampe
   const setTorch = async (track: MediaStreamTrack, on: boolean): Promise<boolean> => {
     try {
-      await track.applyConstraints({ advanced: [{ torch: on } as any] });
+      await track.applyConstraints({ advanced: [withCurrent({ torch: on }) as any] });
       const settings: any = track.getSettings?.() ?? {};
       const caps: any = track.getCapabilities?.() ?? {};
       if (settings.torch !== undefined) return settings.torch === on;
@@ -421,7 +510,7 @@ export const GuidedVisit: React.FC<Props> = ({
     const caps: any = track.getCapabilities?.() ?? {};
     if (!caps.exposureCompensation) return;
     try {
-      await track.applyConstraints({ advanced: [{ exposureCompensation: on ? caps.exposureCompensation.max : 0 } as any] });
+      await track.applyConstraints({ advanced: [withCurrent({ exposureCompensation: on ? caps.exposureCompensation.max : 0 }) as any] });
     } catch {
       /* non pris en charge */
     }
@@ -567,6 +656,50 @@ export const GuidedVisit: React.FC<Props> = ({
     if (isOffline) setNetMode('offline');
   }, [isOffline]);
 
+  // Pincer l'image = zoomer la caméra. Le zoom de la page est bloqué pendant la visite.
+  useEffect(() => {
+    if (phase !== 'running') return;
+    const el = containerRef.current;
+    if (!el) return;
+    const meta = document.querySelector('meta[name="viewport"]');
+    const previous = meta?.getAttribute('content') ?? null;
+    meta?.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover');
+
+    let pinch: { dist: number; zoom: number } | null = null;
+    const spread = (t: TouchList) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) || 1;
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        pinch = { dist: spread(e.touches), zoom: currentZoom() };
+      }
+    };
+    const onMove = (e: TouchEvent) => {
+      if (e.touches.length < 2) return;
+      e.preventDefault();
+      if (!pinch) pinch = { dist: spread(e.touches), zoom: currentZoom() };
+      setZoomRef.current((pinch.zoom * spread(e.touches)) / pinch.dist);
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) pinch = null;
+    };
+    const block = (e: Event) => e.preventDefault(); // Safari : gestes de zoom de la page
+    el.addEventListener('touchstart', onStart, { passive: false });
+    el.addEventListener('touchmove', onMove, { passive: false });
+    el.addEventListener('touchend', onEnd);
+    el.addEventListener('touchcancel', onEnd);
+    el.addEventListener('gesturestart', block as EventListener, { passive: false } as AddEventListenerOptions);
+    el.addEventListener('gesturechange', block as EventListener, { passive: false } as AddEventListenerOptions);
+    return () => {
+      el.removeEventListener('touchstart', onStart);
+      el.removeEventListener('touchmove', onMove);
+      el.removeEventListener('touchend', onEnd);
+      el.removeEventListener('touchcancel', onEnd);
+      el.removeEventListener('gesturestart', block as EventListener);
+      el.removeEventListener('gesturechange', block as EventListener);
+      if (meta && previous !== null) meta.setAttribute('content', previous);
+    };
+  }, [phase]);
+
   // Branche le flux caméra sur la vidéo dès qu'elle est affichée
   useEffect(() => {
     const video = videoRef.current;
@@ -677,18 +810,20 @@ export const GuidedVisit: React.FC<Props> = ({
    * Éléments signalés par l'IA sur l'image envoyée : chacun devient un repère, ancré par sa direction
    * (orientation du téléphone au moment de l'image). Un élément déjà repéré (même libellé) est simplement mis à jour.
    */
-  const ingestElements = (elements: VisibleElement[], pose: ReturnType<OrientationSource['pose']>, vdims: { w: number; h: number }) => {
+  const ingestElements = (
+    elements: VisibleElement[], pose: ReturnType<OrientationSource['pose']>, vdims: { w: number; h: number }, zoom = { hw: 1, d: 1 },
+  ) => {
     if (!elements.length) return;
     const { schema: sch } = propsRef.current;
     const th = visitRef.current.theme;
-    const fov = fieldOfView(vdims.w || 16, vdims.h || 9);
+    const fov = fieldOfView(vdims.w || 16, vdims.h || 9, zoom.hw);
     const now = Date.now();
     let changed = false;
     for (const e of elements) {
       if (!sch[e.category] || NON_VISUAL_CATEGORIES.includes(e.category)) continue;
       if (th !== ALL_ZONES && e.category !== th) continue;
       if (e.box.length !== 4 || !e.label) continue;
-      const box = boxFromArray(e.box);
+      const box = uncrop(boxFromArray(e.box), zoom.d);
       const dir = pose ? unproject(box.cx, box.cy, pose, fov) : null;
       const pts = pointsRef.current;
       let pt = pts.find(q => q.category === e.category && sameText(q.label, e.label));
@@ -951,8 +1086,9 @@ export const GuidedVisit: React.FC<Props> = ({
       return;
     }
     const filter = lightRef.current === 'boost' ? LOW_LIGHT_FILTER : undefined;
-    const hd = grabJpeg(video, HD_MAX_SIDE, 0.82, filter);
-    const thumb = grabJpeg(video, 200, 0.6, filter);
+    const crop = zoomRef.current.digital;
+    const hd = grabJpeg(video, HD_MAX_SIDE, 0.82, filter, crop);
+    const thumb = grabJpeg(video, 200, 0.6, filter, crop);
     if (!hd || !thumb) return;
     capturingRef.current = true;
     const id = newId();
@@ -1007,7 +1143,8 @@ export const GuidedVisit: React.FC<Props> = ({
   const sendFrame = useCallback(async (small: Uint8ClampedArray | null) => {
     const video = videoRef.current;
     if (!video) return;
-    const image = grabJpeg(video, GUIDE_MAX_SIDE, 0.6, lightRef.current === 'boost' ? LOW_LIGHT_FILTER : undefined);
+    const zoomAtSend = { hw: zoomRef.current.hw, d: zoomRef.current.digital };
+    const image = grabJpeg(video, GUIDE_MAX_SIDE, 0.6, lightRef.current === 'boost' ? LOW_LIGHT_FILTER : undefined, zoomAtSend.d);
     if (!image) return;
 
     // État du téléphone au moment de l'image : sert à placer le cadre quand la réponse arrivera
@@ -1102,10 +1239,10 @@ export const GuidedVisit: React.FC<Props> = ({
       // Repères : tout ce que l'IA a vu sur cette image (même pendant un élément en cours).
       // Si l'IA croit voir une autre pièce sans que ce soit confirmé, on attend de savoir où ranger ces éléments.
       if (spaceCandidateRef.current) {
-        deferredRef.current = [...deferredRef.current, { elements: guide.elements ?? [], pose: poseAtSend, dims: videoDims }].slice(-3);
+        deferredRef.current = [...deferredRef.current, { elements: guide.elements ?? [], pose: poseAtSend, dims: videoDims, zoom: zoomAtSend }].slice(-3);
       } else {
-        for (const d of deferredRef.current.splice(0)) ingestElements(d.elements, d.pose, d.dims);
-        ingestElements(guide.elements ?? [], poseAtSend, videoDims);
+        for (const d of deferredRef.current.splice(0)) ingestElements(d.elements, d.pose, d.dims, d.zoom);
+        ingestElements(guide.elements ?? [], poseAtSend, videoDims, zoomAtSend);
       }
 
       // Séquence : étape absente, photo de l'étape, ou démarrage du prochain élément
@@ -1132,8 +1269,8 @@ export const GuidedVisit: React.FC<Props> = ({
           const label = (guide.target.split('—')[0] ?? '').trim() || proposed.title;
           const known = pointsRef.current.find(pt => sameText(pt.label, label));
           if (!known && !doneHereRef.current.some(t => sameText(t, label))) {
-            const box = guide.targetBox.length === 4 ? boxFromArray(guide.targetBox) : null;
-            const dir = box && poseAtSend ? unproject(box.cx, box.cy, poseAtSend, fieldOfView(videoDims.w || 16, videoDims.h || 9)) : null;
+            const box = guide.targetBox.length === 4 ? uncrop(boxFromArray(guide.targetBox), zoomAtSend.d) : null;
+            const dir = box && poseAtSend ? unproject(box.cx, box.cy, poseAtSend, fieldOfView(videoDims.w || 16, videoDims.h || 9, zoomAtSend.hw)) : null;
             startPoint(addPoint({ category: guide.nextCategory, element: guide.nextElement, label, dir, box }));
             started = 'ai';
           }
@@ -1145,14 +1282,7 @@ export const GuidedVisit: React.FC<Props> = ({
       const tracker = trackerRef.current;
       const label = activeRef.current ? stepTarget(activeRef.current) : guide.target || guide.instruction;
       if (guide.targetBox.length === 4) {
-        const [ymin, xmin, ymax, xmax] = guide.targetBox;
-        tracker.setTarget(
-          { cx: (xmin + xmax) / 2000, cy: (ymin + ymax) / 2000, w: (xmax - xmin) / 1000, h: (ymax - ymin) / 1000 },
-          label,
-          poseAtSend,
-          grayAtSend,
-          videoDims,
-        );
+        tracker.setTarget(uncrop(boxFromArray(guide.targetBox), zoomAtSend.d), label, poseAtSend, grayAtSend, videoDims, zoomAtSend.hw);
       } else if (!sameText(label, tracker.currentLabel)) {
         const d = guide.targetDirection;
         if (d === 'gauche' || d === 'droite' || d === 'haut' || d === 'bas' || d === 'derriere') tracker.setHint(d, label);
@@ -1267,6 +1397,13 @@ export const GuidedVisit: React.FC<Props> = ({
       if (el && el.style.display !== 'none') el.style.display = 'none';
     };
 
+    /** Image vidéo (0-1) → écran, avec l'agrandissement du zoom numérique autour du centre. */
+    const toScreen = (cx: number, cy: number, vdim: { w: number; h: number }, vw: number, vh: number) => {
+      const p = videoToScreen(cx, cy, vdim, { w: vw, h: vh });
+      const d = zoomRef.current.digital;
+      return d > 1.001 ? { x: vw / 2 + (p.x - vw / 2) * d, y: vh / 2 + (p.y - vh / 2) * d } : p;
+    };
+
     // Repères des éléments repérés : jaune = à faire, vert = fait, gris = passé.
     // Hors écran, un élément à faire reste signalé par un petit point au bord, du côté où il se trouve.
     const pinEls = pinElsRef.current;
@@ -1299,7 +1436,7 @@ export const GuidedVisit: React.FC<Props> = ({
       layer.style.display = showSetupRef.current ? 'none' : '';
       if (showSetupRef.current) return;
       const pose = orientationRef.current.pose();
-      const fov = fieldOfView(vdim.w, vdim.h);
+      const fov = fieldOfView(vdim.w, vdim.h, zoomRef.current.hw);
       const now = Date.now();
       const activeId = activeRef.current?.pointId;
       const top = Math.min(240, vh * 0.32);
@@ -1326,7 +1463,7 @@ export const GuidedVisit: React.FC<Props> = ({
         let visible = false;
         if (pose && pt.dir) {
           const pr = project(pt.dir, pose, fov);
-          const sc = videoToScreen(pr.cx, pr.cy, vdim, { w: vw, h: vh });
+          const sc = toScreen(pr.cx, pr.cy, vdim, vw, vh);
           if (!pr.behind && sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
             x = sc.x;
             y = sc.y;
@@ -1348,7 +1485,7 @@ export const GuidedVisit: React.FC<Props> = ({
             edge = true;
           }
         } else if (pt.box && now - pt.seenAt < RECENT_BOX_MS) {
-          const sc = videoToScreen(pt.box.cx, pt.box.cy, vdim, { w: vw, h: vh });
+          const sc = toScreen(pt.box.cx, pt.box.cy, vdim, vw, vh);
           if (sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
             x = sc.x;
             y = sc.y;
@@ -1398,11 +1535,11 @@ export const GuidedVisit: React.FC<Props> = ({
       const vdim = { w: video.videoWidth, h: video.videoHeight };
       const vw = view.clientWidth;
       const vh = view.clientHeight;
-      const state: ARState = tracker.update(vdim, gray);
+      const state: ARState = tracker.update(vdim, gray, zoomRef.current.hw);
 
       if (state.kind === 'box') {
         // Petit repère posé sur l'élément (centre du cadre), qui suit l'élément en direct
-        const c = videoToScreen(state.box.cx, state.box.cy, vdim, { w: vw, h: vh });
+        const c = toScreen(state.box.cx, state.box.cy, vdim, vw, vh);
         const onScreen = c.x > 8 && c.x < vw - 8 && c.y > 8 && c.y < vh - 8;
         if (onScreen) {
           box.style.display = 'block';
@@ -1434,7 +1571,7 @@ export const GuidedVisit: React.FC<Props> = ({
       let dy: number;
       let behind = false;
       if (state.kind === 'offscreen') {
-        const c = videoToScreen(0.5 + state.dx, 0.5 + state.dy, vdim, { w: vw, h: vh });
+        const c = toScreen(0.5 + state.dx, 0.5 + state.dy, vdim, vw, vh);
         dx = c.x - vw / 2;
         dy = c.y - vh / 2;
         behind = state.behind;
@@ -1884,7 +2021,12 @@ export const GuidedVisit: React.FC<Props> = ({
   };
 
   return (
-    <div ref={containerRef} className="fixed inset-0 z-[300] bg-black text-white overflow-hidden select-none" data-testid="guided-visit">
+    <div
+      ref={containerRef}
+      className="fixed inset-0 z-[300] bg-black text-white overflow-hidden select-none"
+      style={{ touchAction: 'none' }}
+      data-testid="guided-visit"
+    >
       <video
         ref={videoRef}
         className="absolute inset-0 w-full h-full object-cover"
@@ -1989,6 +2131,18 @@ export const GuidedVisit: React.FC<Props> = ({
 
       {/* Bas : message, consigne, déclencheur */}
       <div className="absolute bottom-0 inset-x-0 z-10 bg-gradient-to-t from-black/70 via-black/30 to-transparent pt-8 safe-bottom">
+        {zoomShown > 1.04 && (
+          <div className="flex justify-center mb-2">
+            <button
+              onClick={() => setZoom(1)}
+              className="px-3 py-1 rounded-full bg-black/60 border border-white/20 text-sm font-bold flex items-center gap-1.5"
+              aria-label="Revenir à 1×"
+              data-testid="zoom-chip"
+            >
+              <ZoomIn size={14} /> {zoomShown.toFixed(1).replace('.', ',')}× <span className="text-white/60 font-semibold">· 1×</span>
+            </button>
+          </div>
+        )}
         {msg && (
           <div className={`mx-3 mb-2 px-3 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-lg ${msg.tone}`} data-testid={msg.testid}>
             {msg.icon && <span className="shrink-0">{msg.icon}</span>}

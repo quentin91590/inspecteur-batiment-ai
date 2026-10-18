@@ -101,10 +101,13 @@ export class OrientationSource {
 
 // ------------------------------------------------------------------ projection caméra
 
-/** Champs de vision (radians) de l'image vidéo : ~66° sur le grand côté d'un capteur de téléphone. */
-export function fieldOfView(videoW: number, videoH: number, longSideDeg = 66): { h: number; v: number } {
-  const long = longSideDeg * DEG;
-  const t = Math.tan(long / 2);
+/**
+ * Champs de vision (radians) de l'image vidéo : ~66° sur le grand côté d'un capteur de téléphone,
+ * divisé par le zoom de la caméra (zoom matériel : l'image vidéo elle-même est agrandie).
+ */
+export function fieldOfView(videoW: number, videoH: number, zoom = 1, longSideDeg = 66): { h: number; v: number } {
+  const t = Math.tan((longSideDeg * DEG) / 2) / Math.max(0.25, zoom);
+  const long = 2 * Math.atan(t);
   if (videoW >= videoH) return { h: long, v: 2 * Math.atan((t * videoH) / videoW) };
   return { h: 2 * Math.atan((t * videoW) / videoH), v: long };
 }
@@ -256,12 +259,14 @@ export class TargetTracker {
    * Nouvelle position donnée par l'IA pour l'image envoyée à l'instant t0.
    * poseAtCapture / frameAtCapture : état du téléphone et de l'image à t0 (la réponse arrive 1-2 s plus tard).
    */
-  setTarget(box: NormBox, label: string, poseAtCapture: CameraPose | null, frameAtCapture: GrayFrame | null, video: { w: number; h: number }): void {
+  setTarget(
+    box: NormBox, label: string, poseAtCapture: CameraPose | null, frameAtCapture: GrayFrame | null, video: { w: number; h: number }, zoomAtCapture = 1,
+  ): void {
     this.box = { ...box };
     this.label = label;
     this.hintDir = null;
     this.lastSeenAt = Date.now();
-    this.dir = poseAtCapture ? unproject(box.cx, box.cy, poseAtCapture, fieldOfView(video.w, video.h)) : null;
+    this.dir = poseAtCapture ? unproject(box.cx, box.cy, poseAtCapture, fieldOfView(video.w, video.h, zoomAtCapture)) : null;
     if (frameAtCapture) this.matcher.setFrom(frameAtCapture, box);
     else this.matcher.clear();
   }
@@ -284,11 +289,11 @@ export class TargetTracker {
   }
 
   /** À appeler à chaque image d'affichage ; frame (facultatif) permet le recalage par l'image. */
-  update(video: { w: number; h: number }, frame: GrayFrame | null): ARState {
+  update(video: { w: number; h: number }, frame: GrayFrame | null, zoom = 1): ARState {
     if (this.hintDir && !this.box) return { kind: 'hint', direction: this.hintDir, label: this.label };
     if (!this.box) return { kind: 'none' };
 
-    const fov = fieldOfView(video.w, video.h);
+    const fov = fieldOfView(video.w, video.h, zoom);
     const pose = this.orientation.pose();
     let pred = { cx: this.box.cx, cy: this.box.cy, behind: false };
     if (this.dir && pose) pred = project(this.dir, pose, fov);

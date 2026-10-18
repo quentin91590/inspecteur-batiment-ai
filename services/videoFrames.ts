@@ -40,19 +40,25 @@ export function meanLuma(a: Uint8ClampedArray | null): number {
 /** Éclaircissement appliqué quand la lampe n'est pas disponible (mode faible lumière). */
 export const LOW_LIGHT_FILTER = 'brightness(1.75) contrast(1.12)';
 
-/** Image JPEG (data URL) de la vidéo, plus grand côté limité à maxSide ; filter = éclaircissement éventuel. */
-export function grabJpeg(video: HTMLVideoElement, maxSide: number, quality: number, filter?: string): string | null {
+/**
+ * Image JPEG (data URL) de la vidéo, plus grand côté limité à maxSide ; filter = éclaircissement éventuel ;
+ * crop = zoom numérique (on ne garde que le centre de l'image, 1/crop de chaque côté).
+ */
+export function grabJpeg(video: HTMLVideoElement, maxSide: number, quality: number, filter?: string, crop = 1): string | null {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (!vw || !vh) return null;
-  const scale = Math.min(1, maxSide / Math.max(vw, vh));
+  const z = Math.max(1, crop);
+  const sw = vw / z;
+  const sh = vh / z;
+  const scale = Math.min(1, maxSide / Math.max(sw, sh));
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(vw * scale);
-  canvas.height = Math.round(vh * scale);
+  canvas.width = Math.round(sw * scale);
+  canvas.height = Math.round(sh * scale);
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
   if (filter) ctx.filter = filter;
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/jpeg', quality);
 }
 
