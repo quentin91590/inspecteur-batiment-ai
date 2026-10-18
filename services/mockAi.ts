@@ -8,6 +8,7 @@ let stepCalls = 0;
 let lastStep = '';
 let analyzeCounter = 0;
 let demoSpace = ''; // pièce simulée après « Pièce suivante »
+let plateChecks = 0; // une photo de plaque sur deux est refusée (pour montrer la reprise)
 const DEMO_SPACES = ['Couloir (démo)', 'Cuisine (démo)', 'Salle de bain (démo)'];
 
 export const DEMO_MODEL_ID = 'demo:simulation';
@@ -160,6 +161,14 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
         },
         meta: meta(),
       };
+    }
+
+    case 'checkPhoto': {
+      await wait(500);
+      if (/plaque/i.test(req.step) && plateChecks++ % 2 === 0) {
+        return { check: { ok: false, problem: 'plaque illisible', advice: 'Rapprochez-vous de la plaque' }, meta: meta() };
+      }
+      return { check: { ok: true, problem: '', advice: '' }, meta: meta() };
     }
 
     case 'analyzeImage': {

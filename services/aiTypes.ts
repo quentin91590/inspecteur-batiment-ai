@@ -87,6 +87,30 @@ export interface GuideRequest {
   model?: string;
 }
 
+/** Contrôle rapide d'une photo prise à la main pendant une étape : est-elle exploitable ? */
+export interface CheckPhotoRequest {
+  task: 'checkPhoto';
+  /** JPEG base64 sans préfixe */
+  image: string;
+  /** Élément, ex : « Fenêtre PVC » */
+  element: string;
+  /** Étape, ex : « Vitrage et intercalaire » */
+  step: string;
+  /** Ce que la photo doit montrer */
+  aim?: string;
+  /** Étape facultative (le sujet peut ne pas exister) */
+  optional?: boolean;
+  model?: string;
+}
+
+export interface PhotoCheck {
+  ok: boolean;
+  /** Problème en quelques mots (« plaque illisible »), vide si ok */
+  problem: string;
+  /** Consigne pour reprendre (« Rapprochez-vous de la plaque »), vide si ok */
+  advice: string;
+}
+
 /** Élément visible à l'image (une entrée par variante : chaque revêtement, chaque peinture…) */
 export interface VisibleElement {
   category: string;
@@ -104,6 +128,7 @@ export type AiRequest =
   | AnalyzeTextRequest
   | SummarizeRequest
   | GuideRequest
+  | CheckPhotoRequest
   | ModelsRequest;
 
 export interface RawElement {
@@ -169,6 +194,7 @@ export interface AiResponse {
   elements?: RawElement[];
   text?: string;
   guide?: GuideResult;
+  check?: PhotoCheck;
   models?: ModelInfo[];
   defaults?: Record<Purpose, string>;
   meta?: AiMeta;

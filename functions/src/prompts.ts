@@ -196,6 +196,26 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
 RÉFÉRENTIEL (catégorie : éléments (attributs)) :
 `;
 
+export const CHECK_SYSTEM = `Tu contrôles une photo prise par un inspecteur du bâtiment pendant une visite guidée, étape par étape.
+Réponds uniquement en JSON, en français.
+- ok = true si la photo est EXPLOITABLE pour l'étape : le sujet est visible, assez net et assez éclairé pour relever
+  l'information demandée. Sois tolérant : un cadrage imparfait, un sujet partiel ou un léger flou restent ok si
+  l'information se lit.
+- ok = false seulement si la photo est inexploitable : sujet absent ou hors cadre, flou de bougé, trop sombre,
+  reflet qui masque le sujet, trop loin pour lire le détail demandé (une plaque signalétique doit être LISIBLE).
+- Étape facultative : si la photo montre que le sujet n'existe pas sur cet élément (pas de store…), ok = true.
+- problem : 2 à 5 mots (« plaque illisible », « vitrage flou », « trop sombre »), chaîne vide si ok.
+- advice : consigne impérative de 8 mots maximum pour reprendre (« Rapprochez-vous de la plaque »), chaîne vide si ok.`;
+
+export function checkPhotoUser(element: string, step: string, aim?: string, optional?: boolean): string {
+  return [
+    `Élément : ${element}`,
+    `Étape : ${step}${optional ? ' (facultative)' : ''}`,
+    aim ? `La photo doit montrer : ${aim}` : '',
+    `Cette photo est-elle exploitable pour cette étape ?`,
+  ].filter(Boolean).join('\n');
+}
+
 export function guideSystem(schema: SchemaDefinition): string {
   return `${GUIDE_RULES}${describeSchemaCompact(schema)}`;
 }

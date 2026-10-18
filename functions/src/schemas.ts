@@ -94,6 +94,17 @@ export const GUIDE_SCHEMA: JsonSchema = {
   additionalProperties: false,
 };
 
+export const CHECK_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean', description: 'true si la photo est exploitable pour l’étape' },
+    problem: { type: 'string', description: 'Problème en 2 à 5 mots, chaîne vide si ok' },
+    advice: { type: 'string', description: 'Consigne courte pour reprendre la photo, chaîne vide si ok' },
+  },
+  required: ['ok', 'problem', 'advice'],
+  additionalProperties: false,
+};
+
 /** Gemini n'a pas besoin de additionalProperties : on le retire pour rester dans le sous-ensemble sûr. */
 export function forGemini(schema: JsonSchema): JsonSchema {
   const walk = (node: unknown): unknown => {

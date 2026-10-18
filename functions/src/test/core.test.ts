@@ -257,6 +257,30 @@ describe('guidage spatial et surbrillance', () => {
     assert.deepEqual(res.guide?.elements, []);
   });
 
+  it('contrôle d’une photo prise à la main : modèle rapide, étape transmise, refus lu', async () => {
+    captured.length = 0;
+    usage.length = 0;
+    nextReply = () => geminiReply({ ok: false, problem: 'plaque illisible', advice: 'Rapprochez-vous de la plaque' });
+    const res = await handleAiRequest(
+      { task: 'checkPhoto', image: IMG, element: 'Chaudière gaz', step: 'Plaque signalétique', aim: 'plaque lisible : marque, modèle, année' },
+      'u1', deps(),
+    );
+    const body = captured[0].body;
+    assert.match(captured[0].url, /gemini-3\.5-flash-lite/);
+    assert.match(body.systemInstruction.parts[0].text, /Tu contrôles une photo/);
+    assert.match(body.contents[0].parts[1].text, /Élément : Chaudière gaz\nÉtape : Plaque signalétique\nLa photo doit montrer : plaque lisible/);
+    assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'MINIMAL');
+    assert.deepEqual(res.check, { ok: false, problem: 'plaque illisible', advice: 'Rapprochez-vous de la plaque' });
+    assert.equal(usage[0].purpose, 'guide');
+  });
+
+  it('contrôle : réponse illisible → photo acceptée ; élément ou étape manquant → refusé', async () => {
+    nextReply = () => ({ candidates: [{ content: { role: 'model', parts: [{ text: 'pas du JSON' }] }, finishReason: 'STOP' }] });
+    const res = await handleAiRequest({ task: 'checkPhoto', image: IMG, element: 'Fenêtre', step: 'Cadre' }, 'u1', deps());
+    assert.deepEqual(res.check, { ok: true, problem: '', advice: '' });
+    await assert.rejects(handleAiRequest({ task: 'checkPhoto', image: IMG, element: '', step: 'Cadre' }, 'u1', deps()), /element/);
+  });
+
   it('élément hors image : direction conservée, pas de cadre', async () => {
     nextReply = () => geminiReply({ ...GUIDE_OK, targetBox: [], targetDirection: 'derrière' });
     const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [] }, 'u1', deps());

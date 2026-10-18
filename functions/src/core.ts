@@ -3,12 +3,14 @@ import {
   analysisSystem,
   analyzeImageUser,
   analyzeTextUser,
+  CHECK_SYSTEM,
+  checkPhotoUser,
   guideSystem,
   guideUser,
   summarizePrompt,
 } from './prompts.js';
 import { generate, providerAvailable, ProviderError, type GenerateParams, type ProviderKeys } from './providers.js';
-import { ANALYSIS_SCHEMA, GUIDE_SCHEMA } from './schemas.js';
+import { ANALYSIS_SCHEMA, CHECK_SCHEMA, GUIDE_SCHEMA } from './schemas.js';
 import type {
   AiMeta,
   AiRequest,
@@ -252,11 +254,19 @@ export function normalizeGuide(parsed: unknown): GuideResult {
   };
 }
 
+/** En cas de doute (réponse illisible), la photo est acceptée : on ne bloque jamais l'inspecteur. */
+export function normalizeCheck(parsed: unknown): { ok: boolean; problem: string; advice: string } {
+  const clip = (v: unknown, n: number) => String(v ?? '').trim().slice(0, n);
+  const c = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  const ok = !(c.ok === false || c.ok === 'false');
+  return { ok, problem: ok ? '' : clip(c.problem, 80), advice: ok ? '' : clip(c.advice, 120) };
+}
+
 // ------------------------------------------------------------------ point d'entrée
 
 function purposeOf(task: AiRequest['task']): Purpose | null {
   if (task === 'analyzeImage') return 'analyze';
-  if (task === 'guide') return 'guide';
+  if (task === 'guide' || task === 'checkPhoto') return 'guide'; // modèle rapide, quota du guidage
   if (task === 'analyzeText' || task === 'summarize') return 'text';
   return null;
 }
@@ -297,6 +307,20 @@ export async function handleAiRequest(data: unknown, uid: string, deps: CoreDeps
       params = {
         system: 'Tu es un expert en pathologie du bâtiment. Tu réponds en français.',
         user: summarizePrompt(str(req.comment, 'comment'), str(req.category, 'category', 200), str(req.subCategory, 'subCategory', 200)),
+        speed: 'fast',
+      };
+      break;
+    case 'checkPhoto':
+      params = {
+        system: CHECK_SYSTEM,
+        user: checkPhotoUser(
+          str(req.element, 'element', 120),
+          str(req.step, 'step', 120),
+          str(req.aim, 'aim', 300, false),
+          req.optional === true,
+        ),
+        imageB64: image(req.image),
+        schema: CHECK_SCHEMA,
         speed: 'fast',
       };
       break;
@@ -370,6 +394,15 @@ export async function handleAiRequest(data: unknown, uid: string, deps: CoreDeps
   if (req.task === 'summarize') {
     const text = out.text.replace(/```(?:markdown)?/gi, '').trim();
     return { text, meta };
+  }
+  if (req.task === 'checkPhoto') {
+    let parsed: unknown = {};
+    try {
+      parsed = parseJsonLoose(out.text);
+    } catch {
+      /* réponse illisible : la photo est acceptée */
+    }
+    return { check: normalizeCheck(parsed), meta };
   }
   const parsed = parseJsonLoose(out.text);
   if (req.task === 'guide') return { guide: normalizeGuide(parsed), meta };

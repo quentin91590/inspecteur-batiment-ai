@@ -2,10 +2,10 @@
 import { httpsCallable } from 'firebase/functions';
 import { functions } from '../firebaseConfig';
 import type { InspectionResult, SchemaDefinition } from '../types';
-import type { AiMeta, AiRequest, AiResponse, GuideRequest, GuideResult, ModelInfo, Purpose, RawElement } from './aiTypes';
+import type { AiMeta, AiRequest, AiResponse, GuideRequest, GuideResult, ModelInfo, PhotoCheck, Purpose, RawElement } from './aiTypes';
 import * as mock from './mockAi';
 
-export type { AiMeta, GuideResult, ModelInfo, Purpose } from './aiTypes';
+export type { AiMeta, GuideResult, ModelInfo, PhotoCheck, Purpose } from './aiTypes';
 
 // ------------------------------------------------------------------ mode démo
 
@@ -210,6 +210,15 @@ export async function guideFrame(
   const res = await callAi({ ...req, image: stripDataUrl(req.image), task: 'guide', model: prefFor('guide') });
   if (!res.guide) throw new AiCallError('other', 'Réponse de guidage vide');
   return { guide: res.guide, meta: res.meta };
+}
+
+/** Contrôle rapide d'une photo d'étape prise à la main (modèle du guidage). */
+export async function checkStepPhoto(
+  imageBase64: string,
+  info: { element: string; step: string; aim?: string; optional?: boolean },
+): Promise<{ check: PhotoCheck; meta?: AiMeta }> {
+  const res = await callAi({ task: 'checkPhoto', image: stripDataUrl(imageBase64), ...info, model: prefFor('guide') });
+  return { check: res.check ?? { ok: true, problem: '', advice: '' }, meta: res.meta };
 }
 
 /** Banc d'essai : même photo, modèle imposé. */

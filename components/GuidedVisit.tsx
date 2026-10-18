@@ -11,7 +11,7 @@ import {
 } from '../utils/checklist';
 import { PARCOURS_STAGES, stageText } from '../utils/visit';
 import { protocolFor, type Protocol } from '../utils/protocols';
-import { AiCallError, guideFrame, modelLabel, type AiMeta, type GuideResult } from '../services/aiService';
+import { AiCallError, checkStepPhoto, guideFrame, modelLabel, type AiMeta, type GuideResult, type PhotoCheck } from '../services/aiService';
 import { LOW_LIGHT_FILTER, grabJpeg, grayFrame, meanAbsDiff, meanLuma, smallGray } from '../services/videoFrames';
 import {
   OrientationSource, TargetTracker, angleBetween, fieldOfView, project, unproject, videoToScreen,
@@ -23,7 +23,9 @@ import type { VisibleElement } from '../services/aiTypes';
 
 const TICK_MS = 250;              // analyse locale de l'image (mouvement, luminosité)
 const MIN_SEND_GAP_MS = 1800;     // sans élément en cours : au plus une image toutes les ~2 s
-const STEP_SEND_GAP_MS = 1100;    // pendant une étape : dès que l'image est stable, sans attendre un changement de scène
+const STEP_SEND_GAP_MS = 1100;    // étape en photo automatique : dès que l'image est stable
+const STEP_SEND_GAP_MANUAL_MS = 3000; // étape en photo manuelle : l'IA n'a qu'à aider au cadrage
+const MAX_STEP_GAP_MANUAL_MS = 5000;
 const MAX_SEND_GAP_MS = 4000;     // même sans changement, on rafraîchit la consigne
 const MOTION_STABLE = 6;          // différence moyenne (0-255) sous laquelle l'image est jugée stable
 const NOVELTY_MIN = 9;            // différence avec la dernière image envoyée pour la juger « nouvelle »
@@ -40,6 +42,8 @@ const MAX_POINTS = 30;            // repères par pièce
 const SAME_DIR_DEG = 12;          // même élément signalé sous un autre nom s'il est dans la même direction
 const RECENT_BOX_MS = 2500;       // sans gyroscope, un repère n'est affiché que peu après avoir été vu
 const SPEECH_HINT_MS = 9000;
+const RETAKE_OFFER_MS = 25000;    // proposition de reprendre une photo refusée d'un élément déjà fini
+const AUTO_CAPTURE_KEY = 'inspecteur.guided.autoCapture';
 const LEAVING_MS = 45000;         // après « Pièce suivante », on ne ramène pas l'inspecteur dans la pièce quittée
 
 export interface GuidedCapture {
@@ -93,6 +97,27 @@ interface ActiveElement {
   stepIdx: number;
   photos: number;
   pointId?: string;
+  /** Identifiant de ce passage (une reprise est un nouveau passage) */
+  runId: string;
+  /** Étapes réglées : photo prise, absente ou passée */
+  resolved: number[];
+  /** Reprise d'une photo refusée sur un élément déjà fini */
+  retake?: boolean;
+}
+
+/** Contrôle de la dernière photo d'étape prise à la main */
+interface StepCheck {
+  key: string;
+  label: string;
+  status: 'checking' | 'ok' | 'refused';
+  problem?: string;
+}
+
+/** Photo refusée alors que l'élément est déjà fini : proposition de la reprendre */
+interface RetakeOffer {
+  element: ActiveElement;
+  stepIdx: number;
+  check: PhotoCheck;
 }
 
 interface DoneElement {
@@ -145,6 +170,21 @@ const HINT_VECTOR: Record<string, [number, number]> = {
 const boxFromArray = (b: number[]): NormBox => ({ cx: (b[1] + b[3]) / 2000, cy: (b[0] + b[2]) / 2000, w: (b[3] - b[1]) / 1000, h: (b[2] - b[0]) / 1000 });
 const normText = (s: string) => s.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
+const readAutoCapture = () => {
+  try {
+    return localStorage.getItem(AUTO_CAPTURE_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
+
+/** Prochaine étape non réglée après « from » (puis depuis le début), -1 s'il n'y en a plus. */
+const nextUnresolved = (count: number, from: number, resolved: number[]) => {
+  for (let i = from + 1; i < count; i++) if (!resolved.includes(i)) return i;
+  for (let i = 0; i < from; i++) if (!resolved.includes(i)) return i;
+  return -1;
+};
+
 const newId = () => `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 const fmtSeconds = (ms?: number) => (ms === undefined ? '' : `${(ms / 1000).toFixed(1).replace('.', ',')} s`);
 const sameText = (a?: string, b?: string) => !!a && !!b && normText(a) === normText(b);
@@ -189,6 +229,10 @@ export const GuidedVisit: React.FC<Props> = ({
   const [roomListOpen, setRoomListOpen] = useState(false);
   const [speechHint, setSpeechHint] = useState(false);
   const [spokenSent, setSpokenSent] = useState(false);
+  const [autoCapture, setAutoCapture] = useState(readAutoCapture);
+  const [ready, setReady] = useState(false);
+  const [stepCheck, setStepCheck] = useState<StepCheck | null>(null);
+  const [retakeOffer, setRetakeOffer] = useState<RetakeOffer | null>(null);
 
   // ---------------------------------------------------------------- références (lues par les boucles)
   const containerRef = useRef<HTMLDivElement>(null);
@@ -225,6 +269,8 @@ export const GuidedVisit: React.FC<Props> = ({
   lightRef.current = light;
   const showSetupRef = useRef(showSetup);
   showSetupRef.current = showSetup;
+  const autoCaptureRef = useRef(autoCapture);
+  autoCaptureRef.current = autoCapture;
   const activeRef = useRef<ActiveElement | null>(active);
   activeRef.current = active;
   const doneHereRef = useRef<string[]>([]);
@@ -650,10 +696,13 @@ export const GuidedVisit: React.FC<Props> = ({
     pt.status = 'active';
     const a: ActiveElement = {
       protocol, title: pt.label || protocol.title, category: pt.category, element: pt.element, stepIdx: 0, photos: 0, pointId: pt.id,
+      runId: newId(), resolved: [],
     };
     setActiveNow(a);
+    setStepCheck(null); // un refus tardif de l'élément précédent passe par le bandeau « Reprendre »
     pendingCaptureRef.current = null;
     setPendingCapture(false);
+    setReady(false);
     const recent = Date.now() - pt.seenAt < RECENT_BOX_MS;
     trackerRef.current.setKnown(stepTarget(a), pt.dir, pt.dir || recent ? pt.box : null);
     lastSentAtRef.current = 0;
@@ -680,20 +729,29 @@ export const GuidedVisit: React.FC<Props> = ({
   };
 
   const finishElement = useCallback((a: ActiveElement, photos: number, status: 'done' | 'skipped' = 'done') => {
-    const final = status === 'done' && photos === 0 ? 'skipped' : status;
+    const final = a.retake ? 'done' : status === 'done' && photos === 0 ? 'skipped' : status;
     const pt = findPoint(a.pointId);
     if (pt) {
       pt.status = final;
       pt.photos += photos;
     }
     if (!doneHereRef.current.some(t => sameText(t, a.title))) doneHereRef.current = [...doneHereRef.current, a.title];
-    if (final === 'done') setDoneElements(prev => [...prev, { title: a.title, photos, space: visitRef.current.currentSpace }]);
+    if (a.retake) {
+      setDoneElements(prev => prev.map(d => (d.title === a.title ? { ...d, photos: d.photos + photos } : d)));
+    } else if (final === 'done') {
+      setDoneElements(prev => [...prev, { title: a.title, photos, space: visitRef.current.currentSpace }]);
+    }
     setActiveNow(null);
     trackerRef.current.clear();
     pendingCaptureRef.current = null;
     setPendingCapture(false);
+    setReady(false);
     lastSentAtRef.current = 0;
-    const msg = final === 'done' ? `${a.title} ✓ (${photos} photo${photos > 1 ? 's' : ''})` : `${a.title} : passé`;
+    const msg = a.retake
+      ? `${a.title} : photo reprise ✓`
+      : final === 'done'
+        ? `${a.title} ✓ (${photos} photo${photos > 1 ? 's' : ''})`
+        : `${a.title} : passé`;
     // On enchaîne sur le repère le plus proche
     const next = pickNextPoint();
     if (next) {
@@ -712,13 +770,15 @@ export const GuidedVisit: React.FC<Props> = ({
     if (!a) return;
     pendingCaptureRef.current = null;
     setPendingCapture(false);
+    setReady(false);
     const photos = a.photos + (reason === 'photo' ? 1 : 0);
-    const next = a.stepIdx + 1;
-    if (next >= a.protocol.steps.length) {
-      finishElement(a, photos);
+    const resolved = a.resolved.includes(a.stepIdx) ? a.resolved : [...a.resolved, a.stepIdx];
+    const next = nextUnresolved(a.protocol.steps.length, a.stepIdx, resolved);
+    if (next < 0) {
+      finishElement({ ...a, resolved }, photos);
       return;
     }
-    const na: ActiveElement = { ...a, stepIdx: next, photos };
+    const na: ActiveElement = { ...a, stepIdx: next, photos, resolved };
     setActiveNow(na);
     // Le repère reste sur l'élément ; l'IA le recale sur le sujet de la nouvelle étape
     const pt = findPoint(a.pointId);
@@ -733,6 +793,78 @@ export const GuidedVisit: React.FC<Props> = ({
       key: Date.now(),
     });
   }, [finishElement]);
+
+  /** Retour sur une étape dont la photo a été refusée, dans l'élément en cours ou dans un élément déjà fini (reprise). */
+  const goToStep = (a: ActiveElement, stepIdx: number, check: PhotoCheck) => {
+    const na: ActiveElement = { ...a, stepIdx, resolved: a.resolved.filter(i => i !== stepIdx) };
+    setActiveNow(na);
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    setReady(false);
+    const pt = findPoint(a.pointId);
+    if (pt) pt.status = 'active';
+    trackerRef.current.setKnown(stepTarget(na), pt?.dir ?? null, pt && (pt.dir || Date.now() - pt.seenAt < RECENT_BOX_MS) ? pt.box : null);
+    lastSentAtRef.current = 0;
+    setStepCheck({ key: `${na.runId}:${stepIdx}`, label: na.protocol.steps[stepIdx].label, status: 'refused', problem: check.problem });
+    setInstruction({
+      text: check.advice || `Reprenez : ${na.protocol.steps[stepIdx].label.toLowerCase()}`,
+      detail: '',
+      target: stepTarget(na),
+      quality: 'ok',
+      key: Date.now(),
+    });
+    syncPoints();
+  };
+
+  const onCheckFailed = (a: ActiveElement, stepIdx: number, check: PhotoCheck) => {
+    try {
+      navigator.vibrate?.([70, 90, 70]);
+    } catch {
+      /* pas de vibreur */
+    }
+    const current = activeRef.current;
+    if (current && current.runId === a.runId) {
+      // Toujours sur cet élément : on revient tout de suite sur l'étape refusée
+      goToStep(current, stepIdx, check);
+      return;
+    }
+    // Élément déjà fini : on propose de reprendre, sans interrompre l'élément en cours
+    const offer: RetakeOffer = { element: a, stepIdx, check };
+    setRetakeOffer(offer);
+    window.setTimeout(() => setRetakeOffer(o => (o === offer ? null : o)), RETAKE_OFFER_MS);
+  };
+  const onCheckFailedRef = useRef(onCheckFailed);
+  onCheckFailedRef.current = onCheckFailed;
+
+  const acceptRetake = () => {
+    const offer = retakeOffer;
+    if (!offer) return;
+    setRetakeOffer(null);
+    leavingRef.current = null;
+    releaseActive('todo');
+    const steps = offer.element.protocol.steps.map((_, i) => i);
+    const a: ActiveElement = {
+      ...offer.element, runId: newId(), photos: 0, retake: true, stepIdx: offer.stepIdx, resolved: steps.filter(i => i !== offer.stepIdx),
+    };
+    goToStep(a, offer.stepIdx, offer.check);
+  };
+
+  /** Contrôle rapide de la photo d'étape prise à la main ; l'inspecteur continue pendant ce temps. */
+  const verifyStepPhoto = useCallback((image: string, a: ActiveElement, stepIdx: number) => {
+    if (netModeRef.current === 'offline' || propsRef.current.isOffline) return;
+    const step = a.protocol.steps[stepIdx];
+    const key = `${a.runId}:${stepIdx}`;
+    setStepCheck({ key, label: step.label, status: 'checking' });
+    checkStepPhoto(image, { element: a.title, step: step.label, aim: step.aim, optional: step.optional })
+      .then(({ check }) => {
+        setStepCheck(c => (c && c.key === key ? { ...c, status: check.ok ? 'ok' : 'refused', problem: check.problem } : c));
+        if (!check.ok) onCheckFailedRef.current(a, stepIdx, check);
+      })
+      .catch(() => {
+        // Contrôle impossible (réseau…) : la photo est gardée, on ne bloque pas
+        setStepCheck(c => (c && c.key === key ? null : c));
+      });
+  }, []);
 
   /** « Autre élément » : celui-ci passe en gris (on pourra y revenir), on va au repère le plus proche. */
   const abandonElement = () => {
@@ -795,7 +927,8 @@ export const GuidedVisit: React.FC<Props> = ({
       } catch {
         /* pas de vibreur */
       }
-      if (stepAtCapture && activeRef.current && activeRef.current.title === stepAtCapture.title && activeRef.current.stepIdx === stepAtCapture.stepIdx) {
+      if (stepAtCapture && activeRef.current && activeRef.current.runId === stepAtCapture.runId && activeRef.current.stepIdx === stepAtCapture.stepIdx) {
+        if (origin === 'manuel') verifyStepPhoto(hd, stepAtCapture, stepAtCapture.stepIdx);
         advanceStep('photo');
       } else {
         showToast(origin === 'auto' ? 'Photo enregistrée (hors réseau)' : `Photo prise${requested ? ` : ${requested}` : ''}`);
@@ -803,7 +936,7 @@ export const GuidedVisit: React.FC<Props> = ({
     } finally {
       capturingRef.current = false;
     }
-  }, [showToast, advanceStep]);
+  }, [showToast, advanceStep, verifyStepPhoto]);
 
   const requestCapture = useCallback((target: string, fromStep = false) => {
     const now = Date.now();
@@ -884,12 +1017,15 @@ export const GuidedVisit: React.FC<Props> = ({
       }
       // La réponse concerne-t-elle toujours l'étape en cours ? (l'inspecteur a pu passer l'étape entre-temps)
       const current = activeRef.current;
-      const sameStep = !!activeAtSend && !!current && current.title === activeAtSend.title && current.stepIdx === activeAtSend.stepIdx;
+      const sameStep = !!activeAtSend && !!current && current.runId === activeAtSend.runId && current.stepIdx === activeAtSend.stepIdx;
       const staleStep = !!activeAtSend && !sameStep;
 
+      // Photo manuelle : l'IA signale que c'est bien cadré, l'inspecteur déclenche
+      const readyNow = sameStep && guide.capture && !autoCaptureRef.current;
+      if (sameStep) setReady(readyNow);
       if (!staleStep) {
         setInstruction({
-          text: guide.instruction,
+          text: readyNow ? 'Bien cadré : prenez la photo' : guide.instruction,
           detail: guide.detail,
           target: current ? stepTarget(current) : guide.target,
           quality: guide.sceneQuality,
@@ -924,7 +1060,7 @@ export const GuidedVisit: React.FC<Props> = ({
           advanceStep('absent');
           return;
         }
-        if (guide.capture && !pausedRef.current) requestCapture(stepTarget(current), true);
+        if (guide.capture && autoCaptureRef.current && !pausedRef.current) requestCapture(stepTarget(current), true);
       } else if (!activeAtSend && !current && !askNext && !(leavingRef.current && Date.now() < leavingRef.current.until)) {
         // Parcours guidé : on attend que l'IA lance les relevés dans cet espace (elle peut d'abord guider vers l'étape)
         const here = normText(visitRef.current.currentSpace || guide.space || '');
@@ -967,7 +1103,7 @@ export const GuidedVisit: React.FC<Props> = ({
         else tracker.clear();
       }
 
-      if (!activeAtSend && !activeRef.current && guide.capture && !pausedRef.current) requestCapture(guide.target);
+      if (!activeAtSend && !activeRef.current && guide.capture && autoCaptureRef.current && !pausedRef.current) requestCapture(guide.target);
     } catch (err) {
       speechBufferRef.current = `${transcript} ${speechBufferRef.current}`.trim();
       if (err instanceof AiCallError) {
@@ -1028,7 +1164,7 @@ export const GuidedVisit: React.FC<Props> = ({
     if (offline) {
       // Hors réseau : on enregistre une photo à chaque nouvelle scène stable, analysée plus tard
       const novelty = meanAbsDiff(small, lastCaptureSmallRef.current);
-      if (stable && !dark && novelty > NOVELTY_MIN * 1.5 && now - lastCaptureAtRef.current > OFFLINE_CAPTURE_GAP_MS) {
+      if (autoCaptureRef.current && stable && !dark && novelty > NOVELTY_MIN * 1.5 && now - lastCaptureAtRef.current > OFFLINE_CAPTURE_GAP_MS) {
         void doCapture('', 'auto');
       }
       if (navigator.onLine && !inFlightRef.current && now - lastSentAtRef.current > OFFLINE_RETRY_MS) {
@@ -1045,7 +1181,9 @@ export const GuidedVisit: React.FC<Props> = ({
     const sinceSent = now - lastSentAtRef.current;
     if (activeRef.current) {
       // Pendant une étape : dès que l'image est stable, on demande à l'IA si le sujet est bien cadré
-      if ((stable && sinceSent >= STEP_SEND_GAP_MS) || sinceSent > MAX_SEND_GAP_MS) void sendFrame(small);
+      const gap = autoCaptureRef.current ? STEP_SEND_GAP_MS : STEP_SEND_GAP_MANUAL_MS;
+      const maxGap = autoCaptureRef.current ? MAX_SEND_GAP_MS : MAX_STEP_GAP_MANUAL_MS;
+      if ((stable && sinceSent >= gap) || sinceSent > maxGap) void sendFrame(small);
       return;
     }
     if (sinceSent < MIN_SEND_GAP_MS) return;
@@ -1337,6 +1475,19 @@ export const GuidedVisit: React.FC<Props> = ({
     window.setTimeout(() => setSpeechHint(false), SPEECH_HINT_MS);
   };
 
+  const changeAutoCapture = (on: boolean) => {
+    setAutoCapture(on);
+    autoCaptureRef.current = on;
+    setReady(false);
+    pendingCaptureRef.current = null;
+    setPendingCapture(false);
+    try {
+      localStorage.setItem(AUTO_CAPTURE_KEY, on ? '1' : '0');
+    } catch {
+      /* stockage indisponible : réglage gardé pour cette visite */
+    }
+  };
+
   const askNextSpace = () => {
     releaseActive('todo');
     setInstruction(null);
@@ -1429,6 +1580,26 @@ export const GuidedVisit: React.FC<Props> = ({
             {PARCOURS_STAGES.map(s => <li key={s.id}>{s.label}</li>)}
           </ol>
         </button>
+
+        <div className="pt-2" data-testid="capture-mode">
+          <p className="text-sm font-semibold text-white/85 mb-2">Prise de photo</p>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              [false, 'Manuelle', 'Vous déclenchez ; l’IA vérifie la photo et vous fait reprendre si elle est inexploitable.'],
+              [true, 'Mains libres', 'L’IA déclenche quand c’est bien cadré (sous un évier, vers un plafond…).'],
+            ] as const).map(([on, title, text]) => (
+              <button
+                key={title}
+                onClick={() => changeAutoCapture(on)}
+                className={`text-left p-3 rounded-2xl border ${autoCapture === on ? 'bg-white text-slate-900 border-white' : 'bg-white/5 border-white/10 text-white'}`}
+                data-testid={on ? 'capture-auto' : 'capture-manual'}
+              >
+                <span className="block font-bold text-sm">{title}{!on && <span className={`font-normal ${autoCapture === on ? 'text-slate-500' : 'text-white/50'}`}> · conseillé</span>}</span>
+                <span className={`block text-xs mt-1 ${autoCapture === on ? 'text-slate-600' : 'text-white/65'}`}>{text}</span>
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div className="pt-2">
           <p className="text-sm font-semibold text-white/85 mb-2">Thème (facultatif)</p>
@@ -1629,7 +1800,11 @@ export const GuidedVisit: React.FC<Props> = ({
         {offline && (
           <div className="mt-3 flex items-start gap-2 rounded-xl bg-amber-500/90 text-black px-3 py-2 text-sm font-semibold" data-testid="offline-banner">
             <WifiOff size={18} className="shrink-0 mt-0.5" />
-            <span>Hors réseau : chaque nouvelle scène stable est photographiée et sera analysée au retour du réseau.</span>
+            <span>
+              {autoCapture
+                ? 'Hors réseau : chaque nouvelle scène stable est photographiée et sera analysée au retour du réseau.'
+                : 'Hors réseau : prenez les photos, elles seront analysées au retour du réseau.'}
+            </span>
           </div>
         )}
 
@@ -1655,10 +1830,25 @@ export const GuidedVisit: React.FC<Props> = ({
                       {active.protocol.steps.map((st, i) => (
                         <span
                           key={st.key}
-                          className={`h-1.5 flex-1 rounded-full ${i < active.stepIdx ? 'bg-emerald-400' : i === active.stepIdx ? 'bg-amber-300' : 'bg-white/20'}`}
+                          className={`h-1.5 flex-1 rounded-full ${i === active.stepIdx ? 'bg-amber-300' : active.resolved.includes(i) ? 'bg-emerald-400' : 'bg-white/20'}`}
                         />
                       ))}
                     </div>
+                    {stepCheck && (
+                      <p
+                        className={`mt-1.5 text-xs font-semibold flex items-center gap-1.5 ${stepCheck.status === 'ok' ? 'text-emerald-300' : stepCheck.status === 'refused' ? 'text-rose-300' : 'text-white/70'}`}
+                        data-testid="photo-check"
+                        data-status={stepCheck.status}
+                      >
+                        {stepCheck.status === 'checking' && <Loader2 size={12} className="animate-spin shrink-0" />}
+                        {stepCheck.status === 'ok' && <CheckCircle2 size={12} className="shrink-0" />}
+                        {stepCheck.status === 'refused' && <AlertTriangle size={12} className="shrink-0" />}
+                        <span className="truncate">
+                          Photo « {stepCheck.label} » :{' '}
+                          {stepCheck.status === 'checking' ? 'vérification…' : stepCheck.status === 'ok' ? 'validée' : `refusée${stepCheck.problem ? ` (${stepCheck.problem})` : ''}`}
+                        </span>
+                      </p>
+                    )}
                   </div>
                 )}
                 <div key={instruction.text} className="guide-pop flex items-start gap-3">
@@ -1706,6 +1896,11 @@ export const GuidedVisit: React.FC<Props> = ({
 
       {/* Milieu : indications locales */}
       <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 z-10 flex flex-col items-center gap-2 pointer-events-none px-6">
+        {ready && !pendingCapture && !autoCapture && (
+          <div className="px-4 py-2 rounded-full bg-emerald-500 text-black font-bold text-base flex items-center gap-2 shadow-xl" data-testid="ready-cue">
+            <CheckCircle2 size={18} /> Bien cadré : prenez la photo
+          </div>
+        )}
         {pendingCapture && (
           <div className="px-4 py-2 rounded-full bg-white text-black font-bold text-base flex items-center gap-2 shadow-xl">
             <Hand size={18} /> Ne bougez plus…
@@ -1783,6 +1978,20 @@ export const GuidedVisit: React.FC<Props> = ({
         {toast && (
           <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-emerald-500/90 text-black text-sm font-semibold truncate" data-testid="guided-toast">{toast}</div>
         )}
+        {retakeOffer && (
+          <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-rose-600/95 text-white text-sm flex items-center gap-2" data-testid="retake-offer">
+            <AlertTriangle size={16} className="shrink-0" />
+            <span className="min-w-0 flex-1 truncate font-semibold">
+              {retakeOffer.element.title} · {retakeOffer.element.protocol.steps[retakeOffer.stepIdx].label} : {retakeOffer.check.problem || 'photo inexploitable'}
+            </span>
+            <button onClick={acceptRetake} className="shrink-0 px-2.5 py-1 rounded-full bg-white text-rose-700 text-xs font-bold" data-testid="retake-accept">
+              Reprendre
+            </button>
+            <button onClick={() => setRetakeOffer(null)} className="shrink-0 p-1 rounded-full bg-white/15" aria-label="Ignorer">
+              <X size={14} />
+            </button>
+          </div>
+        )}
         {spaceDone && !offline && (
           <div className="mx-4 mb-2 px-3 py-2 rounded-xl bg-blue-600/90 text-white text-sm font-semibold flex items-center gap-2" data-testid="space-done">
             <DoorOpen size={16} className="shrink-0" />
@@ -1847,7 +2056,7 @@ export const GuidedVisit: React.FC<Props> = ({
           <button
             onClick={() => void doCapture(instruction?.target ?? '', 'manuel')}
             disabled={cameraState !== 'ready'}
-            className={`w-20 h-20 rounded-full border-4 border-white flex items-center justify-center ${waiting ? 'pulse-ring' : ''} disabled:opacity-40`}
+            className={`w-20 h-20 rounded-full border-4 flex items-center justify-center transition-colors ${ready && !autoCapture ? 'border-emerald-400 ring-4 ring-emerald-400/40' : 'border-white'} ${waiting && !ready ? 'pulse-ring' : ''} disabled:opacity-40`}
             aria-label="Prendre une photo"
             data-testid="shutter"
           >
@@ -1858,9 +2067,20 @@ export const GuidedVisit: React.FC<Props> = ({
             Terminer
           </button>
         </div>
-        <p className="text-center text-[11px] text-white/60 mt-2">
-          {captures.length} photo{captures.length > 1 ? 's' : ''} · {doneCount} analysée{doneCount > 1 ? 's' : ''}
-        </p>
+        <div className="mt-2 px-4 flex items-center justify-center gap-2 text-[11px] text-white/60 min-w-0">
+          <span className="truncate">
+            {active && !autoCapture
+              ? `Photo : ${active.protocol.steps[active.stepIdx].label}`
+              : `${captures.length} photo${captures.length > 1 ? 's' : ''} · ${doneCount} analysée${doneCount > 1 ? 's' : ''}`}
+          </span>
+          <button
+            onClick={() => changeAutoCapture(!autoCapture)}
+            className={`shrink-0 px-2 py-0.5 rounded-full font-semibold ${autoCapture ? 'bg-sky-400 text-black' : 'bg-white/15 text-white/80'}`}
+            data-testid="auto-toggle"
+          >
+            {autoCapture ? 'Mains libres' : 'Photo manuelle'}
+          </button>
+        </div>
       </div>
 
       {roomListOpen && (
