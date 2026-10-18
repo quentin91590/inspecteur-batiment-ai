@@ -31,6 +31,8 @@ const MAX_STEP_GAP_MANUAL_MS = 5000;
 const MAX_SEND_GAP_MS = 4000;     // même sans changement, on rafraîchit la consigne
 const MOTION_STABLE = 6;          // différence moyenne (0-255) sous laquelle l'image est jugée stable
 const NOVELTY_MIN = 9;            // différence avec la dernière image envoyée pour la juger « nouvelle »
+const SLOW_MOTION = 14;           // mouvement lent (marche, balayage doux) : image encore exploitable pour repérer
+const NEW_VIEW_GAP_MS = 1500;     // nouvelle partie de la pièce : envoyée dès 1,5 s après la précédente
 const CAPTURE_GAP_MS = 1500;      // délai minimum entre deux photos automatiques
 const SAME_TARGET_GAP_MS = 30000; // pas deux photos du même élément en 30 s
 const PENDING_CAPTURE_MS = 5000;  // la photo demandée attend au plus 5 s que l'image soit stable
@@ -149,9 +151,12 @@ interface SpacePoint {
   box: NormBox | null;
   seenAt: number;
   createdAt: number;
-  /** Nombre d'observations : la direction est la moyenne des observations concordantes */
+  /** Nombre d'observations : la direction est la moyenne des observations concordantes ; confirmé à partir de 2 */
   n: number;
-  status: 'todo' | 'active' | 'done' | 'skipped';
+  /** Images où il aurait dû être vu et ne l'a pas été (repère vu une seule fois) */
+  misses: number;
+  /** rejected : « ce n'est pas ça » (fausse détection), masqué et jamais recréé dans cette pièce */
+  status: 'todo' | 'active' | 'done' | 'skipped' | 'rejected';
   photos: number;
 }
 
@@ -701,6 +706,8 @@ export const GuidedVisit: React.FC<Props> = ({
         restartingRef.current = false;
       }
     };
+    let blackSince = 0;
+    let lastBlackRestart = 0;
     const check = () => {
       if (document.hidden || restartingRef.current) return;
       const video = videoRef.current;
@@ -709,6 +716,21 @@ export const GuidedVisit: React.FC<Props> = ({
       if (!track || track.readyState === 'ended') {
         void restart();
         return;
+      }
+      // Image entièrement noire (caméra reprise par le système sans que la piste s'arrête) : on relance,
+      // au plus une fois toutes les 20 s (une vraie pièce noire n'est jamais à 0)
+      const g = smallGray(video);
+      const luma = g ? meanLuma(g) : 128;
+      if (luma < 3 || track.muted) {
+        blackSince ||= Date.now();
+        if (Date.now() - blackSince > 2500 && Date.now() - lastBlackRestart > 20000) {
+          lastBlackRestart = Date.now();
+          blackSince = 0;
+          void restart();
+          return;
+        }
+      } else {
+        blackSince = 0;
       }
       if (video.paused) void video.play().catch(() => undefined);
       // Image figée (piste coupée sans être terminée) : deux contrôles de suite → on relance
@@ -721,18 +743,37 @@ export const GuidedVisit: React.FC<Props> = ({
         void restart();
       }
     };
+    // On quitte l'appli : on libère la caméra. On revient : on la rouvre (plus fiable que de reprendre
+    // l'ancienne, que certains navigateurs laissent noire).
+    let leftAt = 0;
     const onVisible = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState === 'hidden') {
+        leftAt = Date.now();
+        if (streamRef.current) stopCamera();
+        return;
+      }
       lastTime = -1;
       frozenChecks = 0;
-      window.setTimeout(check, 600);
+      blackSince = 0;
+      if (leftAt || !streamRef.current) {
+        leftAt = 0;
+        void restart();
+      } else {
+        window.setTimeout(check, 600);
+      }
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('pageshow', onVisible);
+    const onPageHide = () => {
+      leftAt = Date.now();
+      if (streamRef.current) stopCamera();
+    };
+    window.addEventListener('pagehide', onPageHide);
     const id = window.setInterval(check, 1500);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('pageshow', onVisible);
+      window.removeEventListener('pagehide', onPageHide);
       window.clearInterval(id);
     };
   }, [phase, startCamera, stopCamera]);
@@ -882,7 +923,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
   const addPoint = (pt: Pick<SpacePoint, 'category' | 'element' | 'label' | 'dir' | 'box'>): SpacePoint => {
     const now = Date.now();
-    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, n: 1, status: 'todo', photos: 0 };
+    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, n: 1, misses: 0, status: 'todo', photos: 0 };
     pointsRef.current = [...pointsRef.current, point];
     return point;
   };
@@ -900,6 +941,7 @@ export const GuidedVisit: React.FC<Props> = ({
     const fov = fieldOfView(vdims.w || 16, vdims.h || 9, zoom.hw);
     const now = Date.now();
     let changed = false;
+    const matched = new Set<string>();
     for (const e of elements) {
       const category = resolveKey(Object.keys(sch), e.category);
       if (!category || NON_VISUAL_CATEGORIES.includes(category)) continue;
@@ -915,6 +957,9 @@ export const GuidedVisit: React.FC<Props> = ({
       let pt = pts.find(q => q.category === category && sameText(q.label, label));
       if (!pt && dir) pt = pts.find(q => q.category === category && q.element === element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
       if (pt) {
+        matched.add(pt.id);
+        if (pt.status === 'rejected') continue; // écarté par l'inspecteur : on ne le remet pas
+        pt.misses = 0;
         // Direction stabilisée : moyenne des observations concordantes ; une observation très éloignée
         // (autre exemplaire du même élément, capteur qui saute) ne déplace pas le repère
         if (dir && !pt.dir) {
@@ -934,15 +979,40 @@ export const GuidedVisit: React.FC<Props> = ({
         continue;
       }
       if (pts.length >= MAX_POINTS) continue;
-      addPoint({ category, element, label, dir, box });
+      matched.add(addPoint({ category, element, label, dir, box }).id);
       changed = true;
+    }
+    // Repère vu une seule fois, absent de deux images où il aurait dû apparaître : fausse détection, on l'enlève
+    if (pose) {
+      for (const pt of pointsRef.current) {
+        if (pt.status !== 'todo' || pt.n >= 2 || !pt.dir || matched.has(pt.id)) continue;
+        const pr = project(pt.dir, pose, fov);
+        const inFrame = !pr.behind && pr.cx > 0.12 && pr.cx < 0.88 && pr.cy > 0.12 && pr.cy < 0.88;
+        if (inFrame) pt.misses += 1;
+      }
+      const before = pointsRef.current.length;
+      pointsRef.current = pointsRef.current.filter(pt => !(pt.status === 'todo' && pt.n < 2 && pt.misses >= 2));
+      if (pointsRef.current.length !== before) changed = true;
     }
     if (changed) syncPoints();
   };
 
+  /** « Ce n'est pas ça » : repère faux, masqué et plus jamais proposé dans cette pièce. */
+  const rejectPoint = (id: string) => {
+    const pt = pointsRef.current.find(q => q.id === id);
+    if (!pt) return;
+    if (pt.status === 'active') releaseActive('todo');
+    pt.status = 'rejected';
+    if (!doneHereRef.current.some(t => sameText(t, pt.label))) doneHereRef.current = [...doneHereRef.current, `${pt.label} (absent)`];
+    setSheetPointId(null);
+    syncPoints();
+    showToast(`${pt.label} : repère retiré`);
+  };
+
   /** Prochain élément : le repère « à faire » le plus proche de là où vise le téléphone. */
   const pickNextPoint = useCallback((): SpacePoint | null => {
-    const todo = pointsRef.current.filter(pt => pt.status === 'todo');
+    // Seulement les repères confirmés (vus au moins deux fois) : une fausse détection n'est jamais lancée d'office
+    const todo = pointsRef.current.filter(pt => pt.status === 'todo' && pt.n >= 2);
     if (!todo.length) return null;
     const pose = orientationRef.current.pose();
     const withDir = pose ? todo.filter(pt => pt.dir) : [];
@@ -1153,7 +1223,9 @@ export const GuidedVisit: React.FC<Props> = ({
     setRoomListOpen(false);
     setSheetPointId(null);
   };
-  onPinTapRef.current = id => choosePoint(id, false);
+  onPinTapRef.current = id => {
+    if (pointsRef.current.some(q => q.id === id)) setSheetPointId(id);
+  };
 
   /** L'inspecteur choisit lui-même l'étape (puce de la liste des photos à prendre). */
   const jumpToStep = (idx: number) => {
@@ -1320,7 +1392,11 @@ export const GuidedVisit: React.FC<Props> = ({
       if (sameStep) setReady(readyNow);
       if (!staleStep) {
         setInstruction({
-          text: readyNow ? 'Bien cadré : prenez la photo' : guide.instruction,
+          text: readyNow
+            ? 'Bien cadré : prenez la photo'
+            : current && !autoCaptureRef.current && /ne bougez plus|c'est cadr/i.test(guide.instruction)
+              ? current.protocol.steps[current.stepIdx].instruction
+              : guide.instruction,
           detail: guide.detail,
           target: current ? stepTarget(current) : guide.target,
           quality: guide.sceneQuality,
@@ -1486,17 +1562,18 @@ export const GuidedVisit: React.FC<Props> = ({
       return;
     }
     const sinceSent = now - lastSentAtRef.current;
+    const novelty = meanAbsDiff(small, lastSentSmallRef.current);
+    // On découvre une autre partie de la pièce (même en bougeant doucement) : on l'envoie vite pour y repérer les éléments
+    const newView = novelty > NOVELTY_MIN * 1.4 && motion < SLOW_MOTION && sinceSent >= NEW_VIEW_GAP_MS;
     if (activeRef.current) {
       // Pendant une étape : dès que l'image est stable, on demande à l'IA si le sujet est bien cadré
       const gap = autoCaptureRef.current ? STEP_SEND_GAP_MS : STEP_SEND_GAP_MANUAL_MS;
       const maxGap = autoCaptureRef.current ? MAX_SEND_GAP_MS : MAX_STEP_GAP_MANUAL_MS;
-      if ((stable && sinceSent >= gap) || sinceSent > maxGap) void sendFrame(small);
+      if ((stable && sinceSent >= gap) || newView || sinceSent > maxGap) void sendFrame(small);
       return;
     }
-    if (sinceSent < MIN_SEND_GAP_MS) return;
-    const novelty = meanAbsDiff(small, lastSentSmallRef.current);
     const hasSpeech = speechBufferRef.current.length > 0;
-    if ((stable && (novelty > NOVELTY_MIN || hasSpeech)) || sinceSent > MAX_SEND_GAP_MS) {
+    if (newView || (sinceSent >= MIN_SEND_GAP_MS && ((stable && (novelty > NOVELTY_MIN || hasSpeech)) || sinceSent > MAX_SEND_GAP_MS))) {
       void sendFrame(small);
     }
   }, [cameraState, doCapture, sendFrame]);
@@ -1573,13 +1650,26 @@ export const GuidedVisit: React.FC<Props> = ({
       let nearest: { el: HTMLElement; d: number } | null = null;
       const zx = vw / 2;
       const zy = (top + bottom) / 2;
+      // Au bord de l'écran : seulement les 4 éléments à faire les plus proches de là où l'on vise
+      const edgeAllowed = new Set(
+        pose
+          ? pts
+              .filter(p => p.status === 'todo' && p.dir)
+              .map(p => ({ id: p.id, a: angleBetween(p.dir!, pose.forward) }))
+              .sort((a, b) => a.a - b.a)
+              .slice(0, 4)
+              .map(p => p.id)
+          : [],
+      );
       for (const pt of order) {
         const el = pinEls.get(pt.id);
         if (!el) continue; // pas encore affiché par React
-        if (pt.id === activeId || pt.status === 'active') {
+        if (pt.id === activeId || pt.status === 'active' || pt.status === 'rejected') {
           hide(el); // l'élément en cours a son grand repère
           continue;
         }
+        const conf = pt.n >= 2 || pt.status !== 'todo' ? '1' : '0';
+        if (el.getAttribute('data-confirmed') !== conf) el.setAttribute('data-confirmed', conf);
         let x = 0;
         let y = 0;
         let edge = false;
@@ -1592,7 +1682,7 @@ export const GuidedVisit: React.FC<Props> = ({
             x = sc.x;
             y = sc.y;
             visible = true;
-          } else if (pt.status === 'todo' && (pr.behind || !inX)) {
+          } else if (pt.status === 'todo' && (pr.behind || !inX) && edgeAllowed.has(pt.id)) {
             // À faire, sur le côté ou derrière : petite icône au bord, du côté où il se trouve
             // (s'il est seulement plus bas ou plus haut, sous le panneau ou la barre, on ne l'affiche pas)
             const cx = vw / 2;
@@ -1887,10 +1977,12 @@ export const GuidedVisit: React.FC<Props> = ({
   const offline = netMode === 'offline' || isOffline;
   const QualityIcon = instruction ? QUALITY_ICON[instruction.quality] ?? Sparkles : Sparkles;
   const spacePhotos = spaces.length ? spaces[spaces.length - 1].photos : 0;
-  const roomDone = roomPoints.filter(pt => pt.status === 'done').length;
+  const roomVisible = roomPoints.filter(pt => pt.status !== 'rejected');
+  const roomDone = roomVisible.filter(pt => pt.status === 'done').length;
   const roomStats = (name: string) => {
     const r = roomsRef.current.get(normText(name));
-    return r ? { total: r.points.length, done: r.points.filter(pt => pt.status === 'done').length } : null;
+    const pts = r ? r.points.filter(pt => pt.status !== 'rejected') : [];
+    return r ? { total: pts.length, done: pts.filter(pt => pt.status === 'done').length } : null;
   };
 
   // ---------------------------------------------------------------- rendu : choix du mode de visite
@@ -2256,9 +2348,9 @@ export const GuidedVisit: React.FC<Props> = ({
           >
             <MapPin size={15} className="shrink-0 text-blue-300" />
             <span className="truncate">{offline ? 'Hors réseau' : currentSpace || 'Pièce en cours d’identification'}</span>
-            {roomPoints.length > 0 && (
+            {roomVisible.length > 0 && (
               <span className="shrink-0 flex items-center gap-1 text-emerald-300" data-testid="room-count">
-                · <ListChecks size={13} /> {roomDone}/{roomPoints.length}
+                · <ListChecks size={13} /> {roomDone}/{roomVisible.length}
               </span>
             )}
           </button>
@@ -2552,7 +2644,15 @@ export const GuidedVisit: React.FC<Props> = ({
                 {sheetPoint && (
                   <p className="text-xs text-white/60 truncate">
                     {!sameText(sheetPoint.element, sheetPoint.label) && `${sheetPoint.element || sheetPoint.category} · `}
-                    {sheetPoint.status === 'done' ? 'relevé ✓' : sheetPoint.status === 'active' ? 'en cours' : sheetPoint.status === 'skipped' ? 'passé' : 'à faire'}
+                    {sheetPoint.status === 'done'
+                      ? 'relevé ✓'
+                      : sheetPoint.status === 'active'
+                        ? 'en cours'
+                        : sheetPoint.status === 'skipped'
+                          ? 'passé'
+                          : sheetPoint.n >= 2
+                            ? 'à faire'
+                            : 'vu une seule fois, à confirmer'}
                   </p>
                 )}
               </div>
@@ -2625,14 +2725,32 @@ export const GuidedVisit: React.FC<Props> = ({
               )}
             </div>
 
-            {sheetPoint && sheetPoint.status !== 'active' && (
+            {sheetPoint && sheetPoint.status === 'done' && (
               <button
                 onClick={() => choosePoint(sheetPoint.id, true)}
                 className="mt-4 w-full py-3 rounded-xl bg-white/10 font-semibold"
                 data-testid="sheet-start"
               >
-                {sheetPoint.status === 'done' ? 'Refaire cet élément' : 'Relever maintenant'}
+                Refaire cet élément
               </button>
+            )}
+            {sheetPoint && (sheetPoint.status === 'todo' || sheetPoint.status === 'skipped') && (
+              <div className="mt-4 grid grid-cols-1 gap-2">
+                <button
+                  onClick={() => choosePoint(sheetPoint.id, true)}
+                  className="w-full py-3 rounded-xl bg-amber-400 text-slate-900 font-bold"
+                  data-testid="sheet-start"
+                >
+                  Relever maintenant
+                </button>
+                <button
+                  onClick={() => rejectPoint(sheetPoint.id)}
+                  className="w-full py-2.5 rounded-xl bg-white/5 text-sm font-semibold text-white/80"
+                  data-testid="sheet-reject"
+                >
+                  Ce n'est pas ça : retirer ce repère
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -2652,12 +2770,12 @@ export const GuidedVisit: React.FC<Props> = ({
               </button>
             </div>
             <p className="text-xs text-white/60 mb-3">
-              {roomPoints.length
-                ? `${roomDone}/${roomPoints.length} éléments faits · touchez un élément jaune pour le relever, vert pour voir ce qui a été relevé`
+              {roomVisible.length
+                ? `${roomDone}/${roomVisible.length} éléments faits · touchez un élément jaune pour le relever, vert pour voir ce qui a été relevé`
                 : 'Rien de repéré pour l’instant : filmez la pièce, les repères apparaissent au fur et à mesure.'}
             </p>
             <ul className="space-y-1.5">
-              {roomPoints.map(pt => {
+              {roomVisible.map(pt => {
                 const isActive = pt.status === 'active';
                 return (
                   <li key={pt.id}>

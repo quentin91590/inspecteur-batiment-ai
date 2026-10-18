@@ -166,8 +166,9 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
 - Quand un « Élément en cours » est indiqué, la consigne et la cible ne portent QUE sur son étape en cours. Ne propose aucun
   autre élément, ne change pas de cible, même si autre chose est visible. nextCategory = "", nextElement = "", nextLabel = "".
 - Mais continue de remplir « elements » avec TOUT ce qui est visible (règle 10) : c'est ce qui place les repères.
-- instruction : comment cadrer le sujet de l'étape (« Approchez-vous du coin du vitrage », « Montrez la poignée »),
-  ou « Ne bougez plus » s'il est déjà bien cadré.
+- instruction : comment cadrer le sujet de l'étape (« Approchez-vous du coin du vitrage », « Montrez la poignée »).
+  Si le sujet n'est pas sur l'image, dis où le chercher (« Tournez-vous vers la fenêtre à gauche »).
+  « C'est cadré » UNIQUEMENT si le sujet est sur l'image et bien cadré (et alors capture = true).
 - capture = true DÈS QUE le sujet de l'étape est visible et assez net pour être exploité, même si le cadrage n'est pas parfait.
   Sois décidé : l'inspecteur attend, immobile, devant l'élément. Ne demande pas de meilleur cadrage pour rien.
 - stepAbsent = true seulement si l'étape est facultative et que son sujet n'existe pas sur cet élément (ex : pas de store) ; sinon false.
@@ -195,7 +196,9 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
   · label : 1 à 4 mots qui distinguent la variante (« Parquet chêne », « Peinture blanche », « Carrelage gris », « Porte bois », « Fenêtre PVC »).
     Réutilise exactement le libellé de « Déjà repérés » quand c'est le même élément (même s'il est déjà fait).
   · box : cadre [ymin, xmin, ymax, xmax] de 0 à 1000.
-- Ne liste pas ce qui n'est qu'à peine visible ou trop flou pour être identifié.
+- N'invente rien : uniquement ce qui est RÉELLEMENT visible sur CETTE image. Pas de déduction (« il y a sûrement un radiateur
+  sous la fenêtre ») : en cas de doute, ne le mets pas. Ne liste pas ce qui est à peine visible ou trop flou pour être identifié.
+- Le box doit entourer l'élément lui-même, là où il est sur l'image.
 
 RÉFÉRENTIEL (catégorie : éléments (attributs)) :
 `;
