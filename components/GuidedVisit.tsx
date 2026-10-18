@@ -11,10 +11,11 @@ import {
 } from '../utils/checklist';
 import { PARCOURS_STAGES, stageText } from '../utils/visit';
 import { protocolFor, type Protocol } from '../utils/protocols';
+import { iconFor } from '../utils/elementIcons';
 import { AiCallError, checkStepPhoto, guideFrame, modelLabel, type AiMeta, type GuideResult, type PhotoCheck } from '../services/aiService';
 import { LOW_LIGHT_FILTER, grabJpeg, grayFrame, meanAbsDiff, meanLuma, smallGray } from '../services/videoFrames';
 import {
-  OrientationSource, TargetTracker, angleBetween, fieldOfView, project, unproject, videoToScreen,
+  OrientationSource, TargetTracker, angleBetween, blendDir, fieldOfView, project, unproject, videoToScreen,
   type ARState, type NormBox, type Vec3,
 } from '../services/arTracker';
 import type { VisibleElement } from '../services/aiTypes';
@@ -148,6 +149,8 @@ interface SpacePoint {
   box: NormBox | null;
   seenAt: number;
   createdAt: number;
+  /** Nombre d'observations : la direction est la moyenne des observations concordantes */
+  n: number;
   status: 'todo' | 'active' | 'done' | 'skipped';
   photos: number;
 }
@@ -879,7 +882,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
   const addPoint = (pt: Pick<SpacePoint, 'category' | 'element' | 'label' | 'dir' | 'box'>): SpacePoint => {
     const now = Date.now();
-    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, status: 'todo', photos: 0 };
+    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, n: 1, status: 'todo', photos: 0 };
     pointsRef.current = [...pointsRef.current, point];
     return point;
   };
@@ -912,7 +915,20 @@ export const GuidedVisit: React.FC<Props> = ({
       let pt = pts.find(q => q.category === category && sameText(q.label, label));
       if (!pt && dir) pt = pts.find(q => q.category === category && q.element === element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
       if (pt) {
-        if (dir && (!pt.dir || pt.status === 'todo')) pt.dir = dir;
+        // Direction stabilisée : moyenne des observations concordantes ; une observation très éloignée
+        // (autre exemplaire du même élément, capteur qui saute) ne déplace pas le repère
+        if (dir && !pt.dir) {
+          pt.dir = dir;
+          pt.n = 1;
+        } else if (dir && pt.dir) {
+          const gap = angleBetween(pt.dir, dir);
+          if (gap < 25) {
+            pt.dir = blendDir(pt.dir, dir, Math.min(pt.n, 6));
+            pt.n += 1;
+          } else if (pt.n <= 1 && pt.status === 'todo') {
+            pt.dir = dir; // première observation sans doute mauvaise
+          }
+        }
         pt.box = box;
         pt.seenAt = now;
         continue;
@@ -1528,32 +1544,22 @@ export const GuidedVisit: React.FC<Props> = ({
     // Repères des éléments repérés : jaune = à faire, vert = fait, gris = passé.
     // Hors écran, un élément à faire reste signalé par un petit point au bord, du côté où il se trouve.
     const pinEls = pinElsRef.current;
-    const makePin = (id: string) => {
-      const el = document.createElement('div');
-      el.setAttribute('data-testid', 'ar-mini');
-      const dot = document.createElement('span');
-      dot.className = 'ar-mini-dot';
-      const lab = document.createElement('span');
-      lab.className = 'ar-mini-label';
-      el.append(dot, lab);
-      const tap = (ev: Event) => {
-        ev.stopPropagation();
-        onPinTapRef.current(id);
-      };
-      dot.addEventListener('click', tap);
-      lab.addEventListener('click', tap);
-      return el;
+    // Position affichée de chaque repère : on glisse vers la nouvelle position au lieu de sauter
+    const shown = new Map<string, { x: number; y: number }>();
+    const glide = (id: string, x: number, y: number) => {
+      const prev = shown.get(id);
+      if (!prev || Math.hypot(x - prev.x, y - prev.y) > 220) {
+        shown.set(id, { x, y });
+        return { x, y };
+      }
+      const next = { x: prev.x + (x - prev.x) * 0.3, y: prev.y + (y - prev.y) * 0.3 };
+      shown.set(id, next);
+      return next;
     };
     const renderPins = (vdim: { w: number; h: number }, vw: number, vh: number) => {
       const layer = pinsLayerRef.current;
       if (!layer) return;
       const pts = pointsRef.current;
-      for (const [id, el] of pinEls) {
-        if (!pts.some(pt => pt.id === id)) {
-          el.remove();
-          pinEls.delete(id);
-        }
-      }
       layer.style.display = showSetupRef.current ? 'none' : '';
       if (showSetupRef.current) return;
       const pose = orientationRef.current.pose();
@@ -1564,15 +1570,12 @@ export const GuidedVisit: React.FC<Props> = ({
       const placed: { x: number; y: number }[] = [];
       // À faire d'abord : en cas de chevauchement, c'est leur nom qui reste lisible
       const order = [...pts].sort((a, b) => (a.status === 'todo' ? 0 : 1) - (b.status === 'todo' ? 0 : 1));
+      let nearest: { el: HTMLElement; d: number } | null = null;
+      const zx = vw / 2;
+      const zy = (top + bottom) / 2;
       for (const pt of order) {
-        let el = pinEls.get(pt.id);
-        if (!el) {
-          el = makePin(pt.id);
-          layer.appendChild(el);
-          pinEls.set(pt.id, el);
-        }
-        const lab = el.lastChild as HTMLElement;
-        if (lab.textContent !== pt.label) lab.textContent = pt.label;
+        const el = pinEls.get(pt.id);
+        if (!el) continue; // pas encore affiché par React
         if (pt.id === activeId || pt.status === 'active') {
           hide(el); // l'élément en cours a son grand repère
           continue;
@@ -1584,11 +1587,14 @@ export const GuidedVisit: React.FC<Props> = ({
         if (pose && pt.dir) {
           const pr = project(pt.dir, pose, fov);
           const sc = toScreen(pr.cx, pr.cy, vdim, vw, vh);
-          if (!pr.behind && sc.x > 6 && sc.x < vw - 6 && sc.y > top && sc.y < bottom) {
+          const inX = sc.x > 6 && sc.x < vw - 6;
+          if (!pr.behind && inX && sc.y > top && sc.y < bottom) {
             x = sc.x;
             y = sc.y;
             visible = true;
-          } else if (pt.status === 'todo') {
+          } else if (pt.status === 'todo' && (pr.behind || !inX)) {
+            // À faire, sur le côté ou derrière : petite icône au bord, du côté où il se trouve
+            // (s'il est seulement plus bas ou plus haut, sous le panneau ou la barre, on ne l'affiche pas)
             const cx = vw / 2;
             const cy = (top + bottom) / 2;
             const dx = sc.x - cx;
@@ -1616,19 +1622,27 @@ export const GuidedVisit: React.FC<Props> = ({
           hide(el);
           continue;
         }
-        const cls = `ar-mini ar-${pt.status}${edge ? ' ar-edge' : ''}`;
-        if (el.className !== cls) {
-          el.className = cls;
-          el.setAttribute('data-status', pt.status);
-          (el.firstChild as HTMLElement).textContent = pt.status === 'done' ? '✓' : pt.status === 'skipped' ? '–' : '';
+        const edgeAttr = edge ? '1' : '0';
+        if (el.getAttribute('data-edge') !== edgeAttr) {
+          el.setAttribute('data-edge', edgeAttr);
+          shown.delete(pt.id); // passage bord ↔ image : pas de glissement à travers l'écran
         }
-        if (el.style.display !== 'block') el.style.display = 'block';
+        if (el.style.display !== 'block') {
+          el.style.display = 'block';
+          shown.delete(pt.id);
+        }
+        ({ x, y } = glide(pt.id, x, y));
         el.style.transform = `translate(${x}px, ${y}px)`;
-        // Deux repères presque au même endroit : un seul nom affiché
-        const crowded = !edge && placed.some(q => Math.abs(q.x - x) < 90 && Math.abs(q.y - y) < 22);
-        lab.style.visibility = crowded ? 'hidden' : '';
-        if (!edge) placed.push({ x, y });
+        el.setAttribute('data-near', '0');
+        if (!edge) {
+          // Le nom n'est affiché que pour le repère le plus proche du centre (pas de texte partout)
+          const crowded = placed.some(q => Math.abs(q.x - x) < 30 && Math.abs(q.y - y) < 30);
+          const d = Math.hypot(x - zx, y - zy);
+          if (!crowded && d < 110 && (!nearest || d < nearest.d)) nearest = { el, d };
+          placed.push({ x, y });
+        }
       }
+      if (nearest) (nearest as { el: HTMLElement }).el.setAttribute('data-near', '1');
     };
 
     const render = () => {
@@ -1670,8 +1684,9 @@ export const GuidedVisit: React.FC<Props> = ({
         const maxX = Math.min(vw - 12, Math.max(c.x, r2.x));
         const onScreen = minY <= maxY && minX <= maxX;
         if (onScreen) {
-          const px = Math.min(Math.max(c.x, minX), maxX);
-          const py = Math.min(Math.max(c.y, minY), maxY);
+          const target = { x: Math.min(Math.max(c.x, minX), maxX), y: Math.min(Math.max(c.y, minY), maxY) };
+          if (box.style.display !== 'block') shown.delete('__active');
+          const { x: px, y: py } = glide('__active', target.x, target.y);
           box.style.display = 'block';
           box.style.transform = `translate(${px}px, ${py}px)`;
           box.classList.toggle('ar-weak', !state.confident);
@@ -1746,8 +1761,6 @@ export const GuidedVisit: React.FC<Props> = ({
     raf = requestAnimationFrame(render);
     return () => {
       cancelAnimationFrame(raf);
-      pinEls.forEach(el => el.remove());
-      pinEls.clear();
     };
   }, [phase, cameraState]);
 
@@ -2053,6 +2066,7 @@ export const GuidedVisit: React.FC<Props> = ({
   // ---------------------------------------------------------------- rendu : caméra
   const LightIcon = light === 'torch' ? Flashlight : light === 'boost' ? SunMedium : FlashlightOff;
   const step = active ? active.protocol.steps[active.stepIdx] : null;
+  const ActiveIcon = active ? iconFor(active.category, active.element, active.title) : MapPin;
   const lastCapture = captures.length ? captures[captures.length - 1] : null;
 
   // Une seule ligne de message à la fois, la plus importante
@@ -2186,12 +2200,42 @@ export const GuidedVisit: React.FC<Props> = ({
       {flashKey > 0 && <div key={flashKey} className="absolute inset-0 bg-white pointer-events-none capture-flash" />}
 
       {/* Repères des éléments repérés dans la pièce (positionnés image par image) */}
-      <div ref={pinsLayerRef} className="ar-pins" data-testid="ar-pins" />
+      <div ref={pinsLayerRef} className="ar-pins" data-testid="ar-pins">
+        {roomPoints.map(pt => {
+          const Icon = iconFor(pt.category, pt.element, pt.label);
+          return (
+            <div
+              key={pt.id}
+              ref={el => {
+                if (el) pinElsRef.current.set(pt.id, el);
+                else pinElsRef.current.delete(pt.id);
+              }}
+              className={`ar-mini ar-${pt.status}`}
+              style={{ display: 'none' }}
+              data-testid="ar-mini"
+              data-status={pt.status}
+            >
+              <button
+                type="button"
+                className="ar-mini-dot"
+                onClick={e => {
+                  e.stopPropagation();
+                  onPinTapRef.current(pt.id);
+                }}
+                aria-label={pt.label}
+              >
+                <Icon size={14} strokeWidth={2.4} />
+              </button>
+              <span className="ar-mini-label">{pt.label}</span>
+            </div>
+          );
+        })}
+      </div>
 
       {/* Repère sur l'élément en cours (positionné image par image) */}
       <div ref={boxRef} className="ar-pin" style={{ display: 'none' }} data-testid="ar-pin">
         <span ref={boxLabelRef} className="ar-pin-label" />
-        <span className="ar-pin-head"><MapPin size={16} strokeWidth={2.5} /></span>
+        <span className="ar-pin-head"><ActiveIcon size={16} strokeWidth={2.5} /></span>
         <span className="ar-pin-dot" />
       </div>
       <div ref={arrowRef} className="ar-arrow" style={{ display: 'none' }} data-testid="ar-arrow">
@@ -2630,11 +2674,19 @@ export const GuidedVisit: React.FC<Props> = ({
                       data-testid="room-item"
                       data-status={pt.status}
                     >
-                      <span
-                        className={`w-6 h-6 rounded-full shrink-0 flex items-center justify-center text-xs font-black border-2 border-white ${pt.status === 'done' ? 'bg-emerald-500' : pt.status === 'skipped' ? 'bg-slate-400' : 'bg-amber-400 text-slate-900'}`}
-                      >
-                        {pt.status === 'done' ? '✓' : pt.status === 'skipped' ? '–' : ''}
-                      </span>
+                      {(() => {
+                        const Icon = iconFor(pt.category, pt.element, pt.label);
+                        return (
+                          <span
+                            className={`relative w-8 h-8 rounded-full shrink-0 flex items-center justify-center border-2 border-white ${pt.status === 'done' ? 'bg-emerald-500 text-white' : pt.status === 'skipped' ? 'bg-slate-400 text-white' : 'bg-amber-400 text-slate-900'}`}
+                          >
+                            <Icon size={15} strokeWidth={2.4} />
+                            {pt.status === 'done' && (
+                              <span className="absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full bg-white text-emerald-600 text-[9px] font-black flex items-center justify-center">✓</span>
+                            )}
+                          </span>
+                        );
+                      })()}
                       <span className="min-w-0 flex-1">
                         <span className="block font-semibold truncate">{pt.label}</span>
                         {!sameText(pt.element, pt.label) && <span className="block text-xs text-white/55 truncate">{pt.element || pt.category}</span>}

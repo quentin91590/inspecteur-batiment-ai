@@ -62,11 +62,31 @@ export function poseFromAngles(alphaDeg: number, betaDeg: number, gammaDeg: numb
   return { right: X, up: Y, forward };
 }
 
+/** Moyenne pondérée de deux directions (a compte pour wA, b pour 1), renormalisée. */
+export const blendDir = (a: Vec3, b: Vec3, wA: number): Vec3 => norm(add(scale(a, wA), b));
+
+const cross = (a: Vec3, b: Vec3): Vec3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
 export class OrientationSource {
-  private angles: { a: number; b: number; g: number; at: number } | null = null;
+  // Pose lissée de l'appareil (écran en portrait) : les capteurs tremblent, surtout la boussole ;
+  // un lissage léger stabilise les repères sans retard perceptible.
+  private smooth: { x: Vec3; y: Vec3; at: number } | null = null;
   private handler = (e: DeviceOrientationEvent) => {
     if (e.alpha === null || e.beta === null || e.gamma === null) return;
-    this.angles = { a: e.alpha, b: e.beta, g: e.gamma, at: Date.now() };
+    const raw = poseFromAngles(e.alpha, e.beta, e.gamma, 0);
+    const now = Date.now();
+    const prev = this.smooth;
+    if (!prev || now - prev.at > 500) {
+      this.smooth = { x: raw.right, y: raw.up, at: now };
+      return;
+    }
+    // Grand saut (recalage de la boussole) : on suit plus vite ; petit tremblement : on lisse fort
+    const jump = angleBetween(prev.y, raw.up) + angleBetween(prev.x, raw.right);
+    const k = jump > 20 ? 0.6 : 0.3;
+    const x = norm(add(scale(prev.x, 1 - k), raw.right, k));
+    const yRaw = add(scale(prev.y, 1 - k), raw.up, k);
+    const y = norm(add(yRaw, x, -dot(yRaw, x))); // orthogonal à x
+    this.smooth = { x, y, at: now };
   };
 
   /** iPhone : l'accès aux capteurs doit être demandé pendant un geste de l'utilisateur. */
@@ -93,9 +113,17 @@ export class OrientationSource {
 
   /** Pose actuelle, ou null si le téléphone ne fournit pas (ou plus) son orientation. */
   pose(): CameraPose | null {
-    if (!this.angles || Date.now() - this.angles.at > 1500) return null;
+    const s = this.smooth;
+    if (!s || Date.now() - s.at > 1500) return null;
+    const X = s.x;
+    const Y = s.y;
+    const forward = scale(cross(X, Y), -1); // la caméra arrière regarde « dans » l'écran (−Z)
     const screenAngle = (screen.orientation?.angle ?? (window as any).orientation ?? 0) as number;
-    return poseFromAngles(this.angles.a, this.angles.b, this.angles.g, screenAngle);
+    const angle = ((Math.round(screenAngle / 90) * 90) % 360 + 360) % 360;
+    if (angle === 90) return { right: scale(Y, -1), up: X, forward };
+    if (angle === 180) return { right: scale(X, -1), up: scale(Y, -1), forward };
+    if (angle === 270) return { right: Y, up: scale(X, -1), forward };
+    return { right: X, up: Y, forward };
   }
 }
 

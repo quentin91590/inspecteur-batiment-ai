@@ -104,55 +104,68 @@ html, body { overflow-x: hidden; }
 }
 .ar-mini-dot {
   position: absolute;
-  left: -11px;
-  top: -11px;
-  width: 22px;
-  height: 22px;
+  left: -14px;
+  top: -14px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border-radius: 999px;
   border: 2px solid #fff;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
-  font-weight: 900;
-  line-height: 1;
   pointer-events: auto;
   cursor: pointer;
 }
 .ar-mini-dot::before {
-  /* zone de toucher plus large que le point */
+  /* zone de toucher plus large que le repère */
   content: '';
   position: absolute;
-  inset: -12px;
+  inset: -10px;
   border-radius: 999px;
 }
 .ar-mini-label {
-  display: none; /* repères sans texte : on touche le repère pour voir l'élément */
+  display: none; /* le nom n'apparaît que pour le repère le plus proche du centre */
   position: absolute;
-  left: 15px;
+  left: 18px;
   top: -10px;
-  max-width: 34vw;
+  max-width: 40vw;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  padding: 2px 7px;
+  padding: 2px 8px;
   border-radius: 999px;
   font-size: 11px;
   font-weight: 700;
-  background: rgba(0, 0, 0, 0.62);
+  background: rgba(0, 0, 0, 0.66);
   color: #fff;
-  pointer-events: auto;
-  cursor: pointer;
+  pointer-events: none;
 }
+.ar-mini[data-near="1"] .ar-mini-label { display: block; }
 .ar-mini.ar-todo .ar-mini-dot { background: #facc15; color: #111827; }
 .ar-mini.ar-done .ar-mini-dot { background: #22c55e; color: #fff; }
-.ar-mini.ar-done .ar-mini-label { background: rgba(21, 128, 61, 0.75); }
+.ar-mini.ar-done .ar-mini-dot::after {
+  content: '✓';
+  position: absolute;
+  right: -5px;
+  top: -5px;
+  width: 13px;
+  height: 13px;
+  border-radius: 999px;
+  background: #fff;
+  color: #16a34a;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 13px;
+  text-align: center;
+}
+.ar-mini.ar-done .ar-mini-label { background: rgba(21, 128, 61, 0.8); }
 .ar-mini.ar-skipped .ar-mini-dot { background: #94a3b8; color: #fff; }
 .ar-mini.ar-skipped { opacity: 0.75; }
-.ar-mini.ar-edge .ar-mini-dot { left: -7px; top: -7px; width: 14px; height: 14px; border-width: 2px; font-size: 0; }
-.ar-mini.ar-edge .ar-mini-label { display: none; }
-.ar-mini.ar-edge { opacity: 0.85; }
+.ar-mini[data-edge="1"] .ar-mini-dot { left: -11px; top: -11px; width: 22px; height: 22px; opacity: 0.9; }
+.ar-mini[data-edge="1"] .ar-mini-dot svg { width: 11px; height: 11px; }
+.ar-mini[data-edge="1"] .ar-mini-label { display: none; }
 .listen-ring {
   border: 2px solid rgba(251, 113, 133, 0.9);
   animation: ar-ping 1.4s ease-out infinite;
