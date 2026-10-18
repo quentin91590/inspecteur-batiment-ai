@@ -1,0 +1,8 @@
+{
+  "name": "Inspecteur Bâtiment AI",
+  "description": "Assistant d'inspection de bâtiment intelligent avec visite guidée en vidéo. Filmez ou photographiez, identifiez des défauts techniques et générez des rapports structurés automatiquement.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}

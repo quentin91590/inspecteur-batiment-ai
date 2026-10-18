@@ -1,0 +1,24 @@
+/* Animations de la visite guidée */
+@keyframes guide-pop {
+  0% { transform: translateY(-6px) scale(0.98); opacity: 0.4; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+.guide-pop { animation: guide-pop 260ms ease-out; }
+
+@keyframes capture-flash {
+  0% { opacity: 0.85; }
+  100% { opacity: 0; }
+}
+.capture-flash { animation: capture-flash 380ms ease-out forwards; }
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.55); }
+  100% { box-shadow: 0 0 0 14px rgba(255, 255, 255, 0); }
+}
+.pulse-ring { animation: pulse-ring 1.2s ease-out infinite; }
+
+.safe-top { padding-top: max(env(safe-area-inset-top), 12px); }
+.safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 16px); }
+
+/* Évite qu'un élément trop large n'élargisse l'écran sur mobile (et ne décale la visite guidée) */
+html, body { overflow-x: hidden; }

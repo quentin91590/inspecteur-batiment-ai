@@ -1,0 +1,26 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Dépendances et builds
+node_modules
+dist
+dist-ssr
+functions/lib
+
+# Clés et réglages locaux : ne jamais publier
+*.local
+.env
+.env.*
+!.env.example
+functions/.env.*
+!functions/.env.example
+.secret.local
+
+# Éditeurs
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?
