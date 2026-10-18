@@ -21,6 +21,7 @@ if ! firebase projects:list >/dev/null 2>&1; then
 fi
 
 echo "▶ Préparation de la fonction…"
+[ -f functions/.env ] || cp functions/.env.example functions/.env
 (cd functions && npm ci --no-audit --no-fund >/dev/null)
 
 # La clé n'est considérée comme enregistrée que si elle a une valeur active (une saisie interrompue crée un secret vide)

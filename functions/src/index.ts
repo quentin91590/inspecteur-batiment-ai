@@ -1,7 +1,7 @@
 import { initializeApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import * as logger from 'firebase-functions/logger';
-import { defineInt, defineSecret } from 'firebase-functions/params';
+import { defineSecret } from 'firebase-functions/params';
 import { HttpsError, onCall } from 'firebase-functions/v2/https';
 import { AiError, handleAiRequest, type CoreDeps, type RemoteConfig } from './core.js';
 import type { AiMeta, Purpose } from './types.js';
@@ -16,7 +16,8 @@ const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
 //   const OPENAI_COMPAT_API_KEY = defineSecret('OPENAI_COMPAT_API_KEY');  + OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_MODELS (defineString)
 // App Check : mettre ENFORCE_APP_CHECK=true dans functions/.env une fois la clé reCAPTCHA configurée dans l'appli
 const ENFORCE_APP_CHECK = process.env.ENFORCE_APP_CHECK === 'true';
-const MIN_INSTANCES = defineInt('AI_MIN_INSTANCES', { default: 0 });
+// Réglages lus dans functions/.env (facultatif) : aucune question n'est posée au déploiement
+const MIN_INSTANCES = Math.max(0, Number(process.env.AI_MIN_INSTANCES ?? 0) || 0);
 
 // --- Réglages Firestore (config/ai), relus au plus toutes les 60 s
 let configCache: { at: number; value: RemoteConfig } | null = null;
