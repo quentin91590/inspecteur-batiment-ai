@@ -77,51 +77,5 @@ export interface Building {
   /** Éléments du référentiel absents de ce bâtiment (« Catégorie::Élément ») : exclus de ce qui reste à faire */
   absent?: string[];
 
-  /** Maquette 3D simple construite pendant les visites guidées */
-  layout?: BuildingLayout;
-
   isConfigured: boolean;
-}
-
-// === MAQUETTE 3D SIMPLE (visite guidée) ===
-// Positions en mètres, relatives au début de la visite : x et y à l'horizontale, z vers le haut.
-
-export interface LayoutRoom {
-  /** Identifiant : nom normalisé */
-  id: string;
-  name: string;
-  /** Étage (0 = rez-de-chaussée, -1 = sous-sol…) */
-  floor: number;
-  center: [number, number];
-  size: [number, number];
-  visitedAt: number;
-}
-
-export interface LayoutElement {
-  id: string;
-  /** Identifiant de la pièce */
-  room: string;
-  category: string;
-  element: string;
-  label: string;
-  status: 'todo' | 'done' | 'skipped';
-  /** Position estimée (m) */
-  pos?: [number, number, number];
-  /** Sinon : direction vue depuis la pièce (radians) */
-  azimuth?: number;
-  elevation?: number;
-  photos: number;
-  /** Empreinte visuelle compacte */
-  fp?: string;
-}
-
-export interface BuildingLayout {
-  version: 1;
-  updatedAt: number;
-  rooms: LayoutRoom[];
-  elements: LayoutElement[];
-  /** Parcours de la dernière visite (allégé), à plat : x0, y0, x1, y1… (Firestore refuse les tableaux de tableaux) */
-  path?: number[];
-  /** Repère orienté au nord grâce à la boussole (sinon orientation arbitraire) */
-  north?: boolean;
 }

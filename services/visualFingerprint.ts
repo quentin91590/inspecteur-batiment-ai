@@ -152,34 +152,3 @@ export function blendFingerprint(a: Fingerprint, b: Fingerprint, wA: number): Fi
   for (let i = 0; i < a.length; i++) out[i] = (a[i] * wA + b[i]) / (wA + 1);
   return out;
 }
-
-/** Empreinte compacte (texte) pour l'enregistrer avec le bâtiment. */
-export function encodeFingerprint(fp: Fingerprint): string {
-  let max = 0;
-  for (let i = 0; i < fp.length; i++) max = Math.max(max, fp[i]);
-  const bytes = new Uint8Array(fp.length);
-  for (let i = 0; i < fp.length; i++) bytes[i] = max ? Math.round((fp[i] / max) * 255) : 0;
-  let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
-}
-
-export function decodeFingerprint(text: string | undefined): Fingerprint | null {
-  if (!text) return null;
-  try {
-    const s = atob(text);
-    if (s.length !== FP_LEN) return null;
-    const fp = new Float32Array(FP_LEN);
-    let sq = 0;
-    for (let i = 0; i < FP_LEN; i++) {
-      fp[i] = s.charCodeAt(i) / 255;
-      sq += fp[i] * fp[i];
-    }
-    // Même échelle que les empreintes calculées (norme 1), pour pouvoir les moyenner
-    const k = sq ? 1 / Math.sqrt(sq) : 0;
-    for (let i = 0; i < FP_LEN; i++) fp[i] *= k;
-    return fp;
-  } catch {
-    return null;
-  }
-}

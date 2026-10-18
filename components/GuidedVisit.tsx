@@ -2,9 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   X, Pause, Play, Mic, MicOff, Flashlight, FlashlightOff, SunMedium, WifiOff, Loader2, CheckCircle2,
   AlertTriangle, ChevronDown, ChevronRight, Sparkles, Sun, ZoomIn, ZoomOut, Focus, Hand, Clock, MapPin,
-  Route, ArrowRight, Navigation, DoorOpen, SkipForward, ListChecks, MoreHorizontal, Camera, Images, Box,
+  Route, ArrowRight, Navigation, DoorOpen, SkipForward, ListChecks, MoreHorizontal, Camera, Images,
 } from 'lucide-react';
-import type { BuildingLayout, InspectionItem, InspectionResult, LayoutElement, QueueItem, SchemaDefinition } from '../types';
+import type { InspectionItem, InspectionResult, QueueItem, SchemaDefinition } from '../types';
 import { AI_COSTS, sortCategories } from '../constants';
 import {
   ALL_ZONES, ALL_ZONES_LABEL, NON_VISUAL_CATEGORIES, buildChecklist, inProgressTargets, missingLines, recordedLines,
@@ -13,12 +13,7 @@ import { PARCOURS_STAGES, stageText } from '../utils/visit';
 import { protocolFor, type Protocol } from '../utils/protocols';
 import { iconFor } from '../utils/elementIcons';
 import { ReferentielPanel, type SpottedVariant } from './ReferentielPanel';
-import {
-  blendFingerprint, decodeFingerprint, encodeFingerprint, fingerprintOf, sampleFrame, similarity,
-  type Fingerprint, type FrameSample,
-} from '../services/visualFingerprint';
-import { StepTracker } from '../services/stepTracker';
-import { buildLayout, estimateDistance, roomId, typicalSize, type RoomInput } from '../utils/layout';
+import { blendFingerprint, fingerprintOf, sampleFrame, similarity, type Fingerprint, type FrameSample } from '../services/visualFingerprint';
 import { AiCallError, checkStepPhoto, guideFrame, modelLabel, type AiMeta, type GuideResult, type PhotoCheck } from '../services/aiService';
 import { LOW_LIGHT_FILTER, grabJpeg, grayFrame, meanAbsDiff, meanLuma, smallGray } from '../services/videoFrames';
 import {
@@ -27,9 +22,6 @@ import {
 } from '../services/arTracker';
 import type { VisibleElement } from '../services/aiTypes';
 import { versionLabel } from '../services/appVersion';
-
-// Maquette 3D : chargée seulement quand on l'ouvre (three.js)
-const Building3D = React.lazy(() => import('./Building3D'));
 
 // ------------------------------------------------------------------ réglages du guidage
 
@@ -56,7 +48,6 @@ const MAX_POINTS = 30;            // repères par pièce
 const SAME_DIR_DEG = 30;          // même élément signalé sous un autre nom s'il est dans la même direction
 const RECENT_BOX_MS = 2500;       // sans gyroscope, un repère n'est affiché que peu après avoir été vu
 const SPEECH_HINT_MS = 9000;
-const EYE_HEIGHT = 1.4;           // hauteur du téléphone tenu devant soi (m)
 const MAX_DIGITAL_ZOOM = 4;       // zoom numérique (recadrage) quand le téléphone ne pilote pas le zoom
 const MAX_HW_ZOOM = 10;
 const RETAKE_OFFER_MS = 25000;    // proposition de reprendre une photo refusée d'un élément déjà fini
@@ -88,10 +79,6 @@ interface Props {
   /** Paroles non rattachées à une photo, analysées comme une note vocale */
   onLeftoverSpeech: (text: string) => void;
   onClose: () => void;
-  /** Maquette du bâtiment enregistrée (visites précédentes) */
-  layout?: BuildingLayout;
-  /** Maquette mise à jour pendant la visite (pièces, éléments, parcours) */
-  onLayoutChange?: (layout: BuildingLayout) => void;
 }
 
 interface InstructionState {
@@ -173,14 +160,9 @@ interface SpacePoint {
   n: number;
   /** Images où il aurait dû être vu et ne l'a pas été (repère vu une seule fois) */
   misses: number;
-  /** Position estimée dans le bâtiment (m, repère du parcours) et nombre d'estimations */
-  pos: [number, number, number] | null;
-  posN: number;
-  /** Empreinte visuelle (moyenne des observations) */
+  /** Empreinte visuelle (moyenne des observations) : reconnaître l'élément vu sous un autre angle */
   fp: Fingerprint | null;
   fpN: number;
-  /** Repris de la maquette d'une visite précédente (pas encore revu) */
-  seeded?: boolean;
   /** rejected : « ce n'est pas ça » (fausse détection), masqué et jamais recréé dans cette pièce */
   status: 'todo' | 'active' | 'done' | 'skipped' | 'rejected';
   photos: number;
@@ -283,7 +265,6 @@ const sameText = (a?: string, b?: string) => !!a && !!b && normText(a) === normT
 
 export const GuidedVisit: React.FC<Props> = ({
   schema, items, queue, captureResults, absent, onSetAbsent, isOffline, demoMode, userCoins, onSpendCoins, onCapture, onLeftoverSpeech, onClose,
-  layout, onLayoutChange,
 }) => {
   // ---------------------------------------------------------------- état affiché
   const [phase, setPhase] = useState<'setup' | 'running' | 'summary'>('setup');
@@ -338,7 +319,6 @@ export const GuidedVisit: React.FC<Props> = ({
   const [spokenVisible, setSpokenVisible] = useState(false);
   const spokenTimerRef = useRef<number | undefined>(undefined);
   const [retakeOffer, setRetakeOffer] = useState<RetakeOffer | null>(null);
-  const [view3d, setView3d] = useState<{ layout: BuildingLayout; user: { x: number; y: number } | null; room?: string } | null>(null);
 
   // ---------------------------------------------------------------- références (lues par les boucles)
   const containerRef = useRef<HTMLDivElement>(null);
@@ -366,7 +346,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const visitRef = useRef({ mode, theme, stageIdx, currentSpace, spaces });
   visitRef.current = { mode, theme, stageIdx, currentSpace, spaces };
   const pausedRef = useRef(paused);
-  pausedRef.current = paused || showSetup || !!blockMsg || !!view3d;
+  pausedRef.current = paused || showSetup || !!blockMsg;
   // (les fiches et listes ouvertes ne mettent pas la visite en pause : la caméra continue de repérer)
   const netModeRef = useRef(netMode);
   netModeRef.current = netMode;
@@ -390,19 +370,6 @@ export const GuidedVisit: React.FC<Props> = ({
   const bottomZoneRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef<ZoomState>({ hw: 1, hwCaps: null, digital: 1, applying: false });
   const roomsRef = useRef(new Map<string, RoomState>());
-  // Parcours (pas + orientation) et maquette du bâtiment
-  const stepsRef = useRef(new StepTracker(() => orientationRef.current.pose()));
-  const layoutDirtyRef = useRef(false);
-  const initialLayoutRef = useRef<BuildingLayout | undefined>(layout);
-  const onLayoutChangeRef = useRef(onLayoutChange);
-  onLayoutChangeRef.current = onLayoutChange;
-  const pathRef = useRef<[number, number][]>([]);
-  const roomPathsRef = useRef(new Map<string, { name: string; path: [number, number][]; visitedAt: number }>());
-  const pendingPathRef = useRef<[number, number][]>([]);
-  const entryRef = useRef<{ x: number; y: number; steps: number } | null>(null);
-  // Passage du repère de cette visite à celui de la maquette : rotation (boussole) puis translation
-  const frameRef = useRef<{ off: number | null; north: boolean; T: [number, number] | null }>({ off: null, north: false, T: null });
-  const lastTRef = useRef<[number, number]>([0, 0]);
 
   const prevSmallRef = useRef<Uint8ClampedArray | null>(null);
   const lastSentSmallRef = useRef<Uint8ClampedArray | null>(null);
@@ -430,7 +397,6 @@ export const GuidedVisit: React.FC<Props> = ({
       dims: { w: number; h: number };
       zoom: { hw: number; d: number };
       sample: FrameSample | null;
-      user: { x: number; y: number };
     }[]
   >([]);
   // « Pièce suivante » : en route vers une autre pièce
@@ -907,163 +873,6 @@ export const GuidedVisit: React.FC<Props> = ({
     if (name) roomsRef.current.set(normText(name), { name, points: pointsRef.current, doneHere: doneHereRef.current });
   }, []);
 
-  // ---------------------------------------------------------------- parcours et maquette 3D
-  /** Rotation vers le nord : figée dès qu'une translation en dépend, sinon dernière estimation de la boussole. */
-  const frameOff = (): number => {
-    const f = frameRef.current;
-    if (f.T) return f.off ?? 0;
-    const off = orientationRef.current.northOffset();
-    f.off = off;
-    f.north = off !== null;
-    return off ?? 0;
-  };
-  const rotate = (x: number, y: number, off: number): [number, number] => [
-    x * Math.cos(off) - y * Math.sin(off),
-    x * Math.sin(off) + y * Math.cos(off),
-  ];
-
-  /** On revient dans une pièce de la maquette enregistrée : elle sert d'ancrage entre les deux visites. */
-  const anchorOn = (name: string, pos: { x: number; y: number }) => {
-    const f = frameRef.current;
-    const stored = initialLayoutRef.current?.rooms.find(r => r.id === roomId(name));
-    if (f.T || !stored) return;
-    const off = frameOff();
-    const [rx, ry] = rotate(pos.x, pos.y, off);
-    f.T = [stored.center[0] - rx, stored.center[1] - ry];
-  };
-
-  /** Éléments déjà relevés dans cette pièce lors d'une visite précédente : ils restent verts quand on les revoit. */
-  const seedFromLayout = (name: string) => {
-    const stored = initialLayoutRef.current;
-    if (!stored) return;
-    const { schema: sch } = propsRef.current;
-    const f = frameRef.current;
-    const off = f.off ?? 0;
-    for (const e of stored.elements) {
-      if (e.room !== roomId(name) || !sch[e.category]) continue;
-      const exists = pointsRef.current.some(
-        p => p.category === e.category && (sameText(p.label, e.label) || (p.element === e.element && similarLabels(p.label, e.label))),
-      );
-      if (exists) continue;
-      const pt = addPoint({ category: e.category, element: e.element, label: e.label, dir: null, box: null });
-      pt.status = e.status;
-      pt.n = e.status === 'todo' ? 1 : 2;
-      // L'IA ne le repropose pas : déjà fait (ou absent) lors de la visite précédente
-      if (e.status !== 'todo' && !doneHereRef.current.some(t => sameText(t, e.label))) {
-        doneHereRef.current = [...doneHereRef.current, e.status === 'done' ? e.label : `${e.label} (absent)`];
-      }
-      pt.photos = e.photos;
-      pt.seeded = true;
-      pt.fp = decodeFingerprint(e.fp);
-      pt.fpN = pt.fp ? 3 : 0;
-      if (e.pos && f.T) {
-        const [x, y] = rotate(e.pos[0] - f.T[0], e.pos[1] - f.T[1], -off);
-        pt.pos = [x, y, e.pos[2]];
-        pt.posN = 2;
-      }
-    }
-  };
-
-  /** Maquette à jour : pièces de cette visite (parcours + éléments) et pièces des visites précédentes. */
-  const exportLayout = useCallback((notify = true): BuildingLayout => {
-    saveRoom();
-    const off = frameOff();
-    const inputs: RoomInput[] = [];
-    for (const [key, rp] of roomPathsRef.current) {
-      const pts = roomsRef.current.get(key)?.points ?? [];
-      inputs.push({
-        name: rp.name,
-        visitedAt: rp.visitedAt,
-        path: rp.path.map(([x, y]) => rotate(x, y, off)),
-        elements: pts
-          .filter(p => p.status !== 'rejected' && (p.n >= 2 || p.seeded || p.status !== 'todo'))
-          .map(p => {
-            const status: LayoutElement['status'] = p.status === 'done' ? 'done' : p.status === 'skipped' ? 'skipped' : 'todo';
-            const el: Omit<LayoutElement, 'room'> = { id: p.id, category: p.category, element: p.element, label: p.label, status, photos: p.photos };
-            if (p.pos) el.pos = [...rotate(p.pos[0], p.pos[1], off), Math.round(p.pos[2] * 100) / 100];
-            if (p.dir) {
-              el.azimuth = Math.atan2(p.dir[0], p.dir[1]) - off;
-              el.elevation = Math.asin(Math.max(-1, Math.min(1, p.dir[2])));
-            }
-            if (p.fp) el.fp = encodeFingerprint(p.fp);
-            return el;
-          }),
-      });
-    }
-    const stored = initialLayoutRef.current;
-    let T = frameRef.current.T;
-    if (!T) {
-      // Aucune pièce commune avec la maquette enregistrée : cette visite est posée à côté
-      T = [0, 0];
-      if (stored?.rooms.length && inputs.length) {
-        const sx = Math.max(...stored.rooms.map(r => r.center[0] + r.size[0] / 2));
-        const sy = stored.rooms.reduce((a, r) => a + r.center[1], 0) / stored.rooms.length;
-        const xs = inputs.flatMap(r => r.path.map(q => q[0]));
-        const ys = inputs.flatMap(r => r.path.map(q => q[1]));
-        if (xs.length) T = [sx + 2 - Math.min(...xs), sy - ys.reduce((a, b) => a + b, 0) / ys.length];
-      }
-    }
-    const [tx, ty] = T;
-    lastTRef.current = T;
-    inputs.forEach(r => {
-      r.path = r.path.map(([x, y]) => [x + tx, y + ty]);
-      r.elements.forEach(e => {
-        if (e.pos) e.pos = [Math.round((e.pos[0] + tx) * 100) / 100, Math.round((e.pos[1] + ty) * 100) / 100, e.pos[2]];
-      });
-    });
-    const path = pathRef.current.map(([x, y]) => {
-      const [rx, ry] = rotate(x, y, off);
-      return [rx + tx, ry + ty] as [number, number];
-    });
-    const result = buildLayout(inputs, stored, path);
-    result.north = frameRef.current.north || (!!stored?.north && !inputs.length);
-    layoutDirtyRef.current = false;
-    if (notify) onLayoutChangeRef.current?.(result);
-    return result;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [saveRoom]);
-
-  /** Ouvre la maquette 3D (à jour), avec la position de l'inspecteur. */
-  const open3d = () => {
-    const current = visitRef.current.currentSpace;
-    const lay = current ? exportLayout() : (initialLayoutRef.current ?? { version: 1 as const, updatedAt: Date.now(), rooms: [], elements: [] });
-    let user: { x: number; y: number } | null = null;
-    if (current) {
-      const here = stepsRef.current.position();
-      const [rx, ry] = rotate(here.x, here.y, frameOff());
-      user = { x: rx + lastTRef.current[0], y: ry + lastTRef.current[1] };
-    }
-    setMenuOpen(false);
-    setView3d({ layout: lay, user, room: current ? roomId(current) : undefined });
-  };
-
-  // Pas détectés : on trace le parcours, pièce par pièce
-  useEffect(() => {
-    const st = stepsRef.current;
-    const off = st.onMove(p => {
-      const pt: [number, number] = [p.x, p.y];
-      pathRef.current.push(pt);
-      const name = visitRef.current.currentSpace;
-      const rp = name ? roomPathsRef.current.get(normText(name)) : null;
-      if (rp) rp.path.push(pt);
-      else pendingPathRef.current.push(pt);
-      layoutDirtyRef.current = true;
-    });
-    return () => {
-      off();
-      st.stop();
-    };
-  }, []);
-
-  // Maquette enregistrée au fil de la visite (toutes les 15 s si quelque chose a changé)
-  useEffect(() => {
-    if (phase !== 'running') return;
-    const id = window.setInterval(() => {
-      if (layoutDirtyRef.current && visitRef.current.currentSpace) exportLayout();
-    }, 15_000);
-    return () => window.clearInterval(id);
-  }, [phase, exportLayout]);
-
   /** Nouvelle pièce : ses repères repartent de zéro (ou de ceux mémorisés si on y revient). */
   const enterSpace = useCallback((name: string) => {
     const prevName = visitRef.current.currentSpace;
@@ -1093,46 +902,11 @@ export const GuidedVisit: React.FC<Props> = ({
       leavingRef.current = null;
     }
     visitRef.current = { ...visitRef.current, currentSpace: name };
-    // Parcours de la pièce (là où l'on est en y entrant, puis chaque pas)
-    const key = normText(name);
-    const here = stepsRef.current.position();
-    let rp = roomPathsRef.current.get(key);
-    if (!rp) {
-      rp = { name, path: pendingPathRef.current.splice(0), visitedAt: Date.now() };
-      roomPathsRef.current.set(key, rp);
-    }
-    rp.path.push([here.x, here.y]);
-    entryRef.current = { ...here, steps: stepsRef.current.steps };
-    anchorOn(name, here);
-    seedFromLayout(name);
-    layoutDirtyRef.current = true;
     setRoomPoints([...pointsRef.current]);
     setCurrentSpace(name);
     setSpaces(prev => (prev.length && sameText(prev[prev.length - 1].name, name) ? prev : [...prev, { name, photos: 0 }]));
     setSpaceDone(null);
   }, []);
-
-  /**
-   * Réponses concordantes nécessaires pour changer de pièce. Après « Pièce suivante » : 2. Sinon 3, l'IA pouvant
-   * croire voir une autre pièce quand on se retourne. Le parcours départage : sans avoir marché, on n'a pas changé
-   * de pièce (5) ; revenu dans une pièce déjà parcourue, la position le confirme (2).
-   */
-  const neededAnswers = (name: string, leaving: boolean): number => {
-    if (leaving) return 2;
-    const st = stepsRef.current;
-    if (!st.steps) return 3; // pas de podomètre (ou pas encore marché)
-    const here = st.position();
-    const known = roomPathsRef.current.get(normText(name));
-    if (known && known.path.length > 1) {
-      const xs = known.path.map(p => p[0]);
-      const ys = known.path.map(p => p[1]);
-      const pad = 1;
-      if (here.x > Math.min(...xs) - pad && here.x < Math.max(...xs) + pad && here.y > Math.min(...ys) - pad && here.y < Math.max(...ys) + pad) return 2;
-    }
-    const entry = entryRef.current;
-    if (entry && Math.hypot(here.x - entry.x, here.y - entry.y) < 1.5 && st.steps - entry.steps < 4) return 5;
-    return 3;
-  };
 
   /** L'IA nomme l'espace à chaque image ; on ne change d'espace qu'après deux réponses concordantes (évite les sauts). */
   const onSpaceSeen = useCallback((name: string) => {
@@ -1152,7 +926,7 @@ export const GuidedVisit: React.FC<Props> = ({
       // Après « Pièce suivante », deux réponses suffisent ; sinon on en veut trois : l'IA peut croire voir une autre
       // pièce quand on se retourne, et on perdrait les repères (verts) de la pièce où l'on est toujours
       const leaving = !!leavingRef.current && Date.now() < leavingRef.current.until;
-      if (cand.count >= neededAnswers(name, leaving)) {
+      if (cand.count >= (leaving ? 2 : 3)) {
         spaceCandidateRef.current = null;
         enterSpace(name);
       }
@@ -1186,9 +960,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
   const addPoint = (pt: Pick<SpacePoint, 'category' | 'element' | 'label' | 'dir' | 'box'>): SpacePoint => {
     const now = Date.now();
-    const point: SpacePoint = {
-      ...pt, id: newId(), seenAt: now, createdAt: now, n: 1, misses: 0, status: 'todo', photos: 0, pos: null, posN: 0, fp: null, fpN: 0,
-    };
+    const point: SpacePoint = { ...pt, id: newId(), seenAt: now, createdAt: now, n: 1, misses: 0, status: 'todo', photos: 0, fp: null, fpN: 0 };
     pointsRef.current = [...pointsRef.current, point];
     return point;
   };
@@ -1198,12 +970,8 @@ export const GuidedVisit: React.FC<Props> = ({
    * (orientation du téléphone au moment de l'image). Un élément déjà repéré (même libellé) est simplement mis à jour.
    */
   const ingestElements = (
-    elements: VisibleElement[],
-    pose: ReturnType<OrientationSource['pose']>,
-    vdims: { w: number; h: number },
-    zoom = { hw: 1, d: 1 },
+    elements: VisibleElement[], pose: ReturnType<OrientationSource['pose']>, vdims: { w: number; h: number }, zoom = { hw: 1, d: 1 },
     sample: FrameSample | null = null,
-    user: { x: number; y: number } | null = null,
   ) => {
     if (!elements.length) return;
     const { schema: sch } = propsRef.current;
@@ -1223,82 +991,45 @@ export const GuidedVisit: React.FC<Props> = ({
       if (!label) continue;
       const box = uncrop(boxFromArray(e.box), zoom.d);
       const dir = pose ? unproject(box.cx, box.cy, pose, fov) : null;
-      // Empreinte visuelle de l'élément (sur l'image envoyée, telle que l'IA l'a vue)
+      // Empreinte visuelle de l'élément, sur l'image telle que l'IA l'a vue
       const [ymin, xmin, ymax, xmax] = e.box;
       const fp = sample ? fingerprintOf(sample, { x0: xmin / 1000, y0: ymin / 1000, x1: xmax / 1000, y1: ymax / 1000 }) : null;
-      // Position estimée : là où l'on est + direction × distance (d'après la taille apparente d'un objet courant)
-      const size = typicalSize(category, element, label);
-      let pos: [number, number, number] | null = null;
-      if (dir && user && size) {
-        const d = estimateDistance(box.w, box.h, size, fov);
-        pos = [user.x + dir[0] * d, user.y + dir[1] * d, EYE_HEIGHT + dir[2] * d];
-      }
-
-      // Même variante ? Même libellé : toujours (une variante = une fiche ; un élément fait reste vert quand on
-      // le revoit, d'où qu'on le voie). Sinon on additionne les indices : libellé proche, aspect, direction, position.
-      let pt: SpacePoint | null = null;
-      let bestScore = -Infinity;
-      for (const q of pointsRef.current) {
-        if (q.category !== category) continue;
-        const sameEl = q.element === element;
-        if (sameText(q.label, label)) {
-          if (bestScore < 100) {
-            bestScore = 100;
-            pt = q;
-          }
-          continue;
-        }
-        let sc = sameEl && similarLabels(q.label, label) ? 2 : sameEl ? 0.5 : -2;
-        if (fp && q.fp) {
-          const sim = similarity(fp, q.fp);
-          sc += sim > 0.92 ? 1.5 : sim > 0.85 ? 0.8 : sim < 0.6 ? -1.5 : 0;
-        }
-        if (dir && q.dir) {
-          const a = angleBetween(q.dir, dir);
-          sc += a < 12 ? 1.5 : a < SAME_DIR_DEG ? 1 : a > 70 ? -0.8 : 0;
-        }
-        if (pos && q.pos) {
-          const dd = Math.hypot(pos[0] - q.pos[0], pos[1] - q.pos[1]);
-          sc += dd < 1.2 ? 1 : dd > 5 ? -1.2 : 0;
-        }
-        if (sc > bestScore) {
-          bestScore = sc;
-          pt = q;
-        }
-      }
-      if (pt && bestScore < 2) pt = null;
-
+      const pts = pointsRef.current;
+      // Même variante : même libellé (ou presque), sinon même élément au même endroit. Un élément déjà fait
+      // reste vert quand on le revoit, même si l'IA le nomme un peu autrement.
+      let pt = pts.find(q => q.category === category && sameText(q.label, label));
+      if (!pt) pt = pts.find(q => q.category === category && q.element === element && similarLabels(q.label, label));
+      if (!pt && dir) pt = pts.find(q => q.category === category && q.element === element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
+      // Même élément qui a exactement le même aspect (revu d'ailleurs, nommé autrement) : c'est le même
+      if (!pt && fp) pt = pts.find(q => q.category === category && q.element === element && !!q.fp && similarity(q.fp, fp) > 0.9);
       if (pt) {
         matched.add(pt.id);
         if (pt.status === 'rejected') continue; // écarté par l'inspecteur : on ne le remet pas
         pt.misses = 0;
-        pt.n += 1;
-        // Direction, position et empreinte : moyennes des observations concordantes ; une observation très
-        // éloignée (autre exemplaire, capteur qui saute) ne déplace pas le repère
-        if (dir && !pt.dir) pt.dir = dir;
-        else if (dir && pt.dir) {
-          const gap = angleBetween(pt.dir, dir);
-          if (gap < 25) pt.dir = blendDir(pt.dir, dir, Math.min(pt.n, 6));
-          else if (pt.n <= 2 && pt.status === 'todo') pt.dir = dir; // première observation sans doute mauvaise
-        }
-        if (pos && (!pt.pos || Math.hypot(pos[0] - pt.pos[0], pos[1] - pt.pos[1]) < 4)) {
-          const w = Math.min(pt.posN, 6);
-          pt.pos = pt.pos ? [(pt.pos[0] * w + pos[0]) / (w + 1), (pt.pos[1] * w + pos[1]) / (w + 1), (pt.pos[2] * w + pos[2]) / (w + 1)] : pos;
-          pt.posN += 1;
-        }
         if (fp) {
           pt.fp = pt.fp ? blendFingerprint(pt.fp, fp, Math.min(pt.fpN, 6)) : fp;
           pt.fpN += 1;
         }
+        // Direction stabilisée : moyenne des observations concordantes ; une observation très éloignée
+        // (autre exemplaire du même élément, capteur qui saute) ne déplace pas le repère
+        if (dir && !pt.dir) {
+          pt.dir = dir;
+          pt.n = 1;
+        } else if (dir && pt.dir) {
+          const gap = angleBetween(pt.dir, dir);
+          if (gap < 25) {
+            pt.dir = blendDir(pt.dir, dir, Math.min(pt.n, 6));
+            pt.n += 1;
+          } else if (pt.n <= 1 && pt.status === 'todo') {
+            pt.dir = dir; // première observation sans doute mauvaise
+          }
+        }
         pt.box = box;
         pt.seenAt = now;
-        layoutDirtyRef.current = true;
         continue;
       }
-      if (pointsRef.current.length >= MAX_POINTS) continue;
+      if (pts.length >= MAX_POINTS) continue;
       const created = addPoint({ category, element, label, dir, box });
-      created.pos = pos;
-      created.posN = pos ? 1 : 0;
       created.fp = fp;
       created.fpN = fp ? 1 : 0;
       matched.add(created.id);
@@ -1316,10 +1047,7 @@ export const GuidedVisit: React.FC<Props> = ({
       pointsRef.current = pointsRef.current.filter(pt => !(pt.status === 'todo' && pt.n < 2 && pt.misses >= 2));
       if (pointsRef.current.length !== before) changed = true;
     }
-    if (changed) {
-      layoutDirtyRef.current = true;
-      syncPoints();
-    }
+    if (changed) syncPoints();
   };
 
   /** « Ce n'est pas ça » : repère faux, masqué et plus jamais proposé dans cette pièce. */
@@ -1678,7 +1406,6 @@ export const GuidedVisit: React.FC<Props> = ({
     const zoomAtSend = { hw: zoomRef.current.hw, d: zoomRef.current.digital };
     const stableAtSend = stableTicksRef.current >= 2;
     const sampleAtSend = sampleFrame(video, zoomAtSend.d);
-    const userAtSend = stepsRef.current.position();
     const image = grabJpeg(video, GUIDE_MAX_SIDE, 0.6, lightRef.current === 'boost' ? LOW_LIGHT_FILTER : undefined, zoomAtSend.d);
     if (!image) return;
 
@@ -1780,11 +1507,11 @@ export const GuidedVisit: React.FC<Props> = ({
       if (spaceCandidateRef.current) {
         deferredRef.current = [
           ...deferredRef.current,
-          { elements: guide.elements ?? [], pose: poseAtSend, dims: videoDims, zoom: zoomAtSend, sample: sampleAtSend, user: userAtSend },
+          { elements: guide.elements ?? [], pose: poseAtSend, dims: videoDims, zoom: zoomAtSend, sample: sampleAtSend },
         ].slice(-3);
       } else {
-        for (const d of deferredRef.current.splice(0)) ingestElements(d.elements, d.pose, d.dims, d.zoom, d.sample, d.user);
-        ingestElements(guide.elements ?? [], poseAtSend, videoDims, zoomAtSend, sampleAtSend, userAtSend);
+        for (const d of deferredRef.current.splice(0)) ingestElements(d.elements, d.pose, d.dims, d.zoom, d.sample);
+        ingestElements(guide.elements ?? [], poseAtSend, videoDims, zoomAtSend, sampleAtSend);
       }
 
       // Séquence : étape absente, photo de l'étape, ou démarrage du prochain élément
@@ -2261,12 +1988,9 @@ export const GuidedVisit: React.FC<Props> = ({
     lastSentAtRef.current = 0;
     if (changedMode || phase !== 'running') setStageIdx(0);
     if (phase !== 'running') {
-      // iPhone : l'accès au gyroscope et à l'accéléromètre doit être demandé pendant ce toucher
+      // iPhone : l'accès au gyroscope doit être demandé pendant ce toucher
       void OrientationSource.requestPermission().then(ok => {
         if (ok) orientationRef.current.start();
-      });
-      void StepTracker.requestPermission().then(ok => {
-        if (ok) stepsRef.current.start();
       });
       setPhase('running');
       setMicOn(speechSupported);
@@ -2326,10 +2050,8 @@ export const GuidedVisit: React.FC<Props> = ({
     if (leftover) onLeftoverSpeech(leftover);
     stopSpeech();
     stopCamera();
-    saveRoom();
-    if (visitRef.current.currentSpace) exportLayout();
     orientationRef.current.stop();
-    stepsRef.current.stop();
+    saveRoom();
     setStats(s => ({ ...s, endedAt: Date.now() }));
     setPhase('summary');
   };
@@ -2447,18 +2169,6 @@ export const GuidedVisit: React.FC<Props> = ({
   if (phase === 'setup') return setupScreen;
 
   // ---------------------------------------------------------------- rendu : bilan
-  const viewer3d = view3d && (
-    <React.Suspense
-      fallback={
-        <div className="fixed inset-0 z-[400] bg-[#0b1220] flex items-center justify-center">
-          <Loader2 size={28} className="animate-spin text-white/70" />
-        </div>
-      }
-    >
-      <Building3D layout={view3d.layout} user={view3d.user} currentRoom={view3d.room} onClose={() => setView3d(null)} />
-    </React.Suspense>
-  );
-
   if (phase === 'summary') {
     const duration = Math.max(0, Math.round(((stats.endedAt || Date.now()) - stats.startedAt) / 60000));
     const avg = stats.frames ? stats.latencyTotal / stats.frames : undefined;
@@ -2528,20 +2238,10 @@ export const GuidedVisit: React.FC<Props> = ({
               {waitingCount} photo{waitingCount > 1 ? 's' : ''} encore dans la file d'analyse{offline ? ' : elles partiront au retour du réseau.' : '.'}
             </p>
           )}
-          {roomPathsRef.current.size > 0 && (
-            <button
-              onClick={open3d}
-              className="w-full py-3 rounded-2xl bg-white/10 hover:bg-white/15 font-semibold flex items-center justify-center gap-2"
-              data-testid="summary-3d"
-            >
-              <Box size={18} /> Voir la maquette 3D
-            </button>
-          )}
           <button onClick={onClose} className="w-full py-3.5 rounded-2xl bg-blue-600 hover:bg-blue-500 font-bold">
             Revenir à l'inspection
           </button>
         </div>
-        {viewer3d}
       </div>
     );
   }
@@ -2726,8 +2426,6 @@ export const GuidedVisit: React.FC<Props> = ({
         <span ref={arrowLabelRef} className="ar-arrow-label" />
       </div>
 
-      {viewer3d}
-
       {/* Haut : une seule ligne */}
       <div className="absolute top-0 inset-x-0 z-10 bg-gradient-to-b from-black/55 to-transparent px-3 pb-5 safe-top">
         <div ref={topBarRef} className="flex items-center gap-2 pt-1">
@@ -2772,9 +2470,6 @@ export const GuidedVisit: React.FC<Props> = ({
               {micOn ? <Mic size={20} /> : <MicOff size={20} />}
             </button>
           )}
-          <button onClick={open3d} className="p-2 rounded-full bg-black/40" aria-label="Maquette 3D du bâtiment" data-testid="open-3d">
-            <Box size={18} />
-          </button>
           <button onClick={() => setMenuOpen(true)} className="p-2.5 rounded-full bg-black/40" aria-label="Menu de la visite" data-testid="menu-button">
             <MoreHorizontal size={20} />
           </button>

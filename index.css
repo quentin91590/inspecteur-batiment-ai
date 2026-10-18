@@ -222,33 +222,3 @@ html, body { overflow-x: hidden; }
   padding: 2px 8px;
   border-radius: 999px;
 }
-
-/* Maquette 3D : étiquettes */
-.b3d-room {
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(15, 23, 42, 0.78);
-  color: #e2e8f0;
-  font: 600 11px/1.4 system-ui, -apple-system, sans-serif;
-  white-space: nowrap;
-}
-.b3d-here {
-  background: #2563eb;
-  color: #fff;
-}
-.b3d-you {
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: #3b82f6;
-  color: #fff;
-  font: 700 10px/1.4 system-ui, -apple-system, sans-serif;
-}
-.b3d-el {
-  padding: 2px 8px;
-  border-radius: 8px;
-  background: #fff;
-  color: #0f172a;
-  font: 600 12px/1.4 system-ui, -apple-system, sans-serif;
-  white-space: nowrap;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-}
