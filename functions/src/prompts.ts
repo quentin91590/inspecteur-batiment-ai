@@ -163,8 +163,9 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
   et nextSpace = chaîne vide (sauf si l'inspecteur demande l'espace suivant).
 
 8. ÉLÉMENT EN COURS (séquence imposée par l'application) — PRIORITAIRE sur les règles 2 à 6
-- Quand un « Élément en cours » est indiqué, occupe-toi UNIQUEMENT de son étape en cours. Ne propose aucun autre élément,
-  ne change pas de cible, même si autre chose est visible. nextCategory = "" et nextElement = "".
+- Quand un « Élément en cours » est indiqué, la consigne et la cible ne portent QUE sur son étape en cours. Ne propose aucun
+  autre élément, ne change pas de cible, même si autre chose est visible. nextCategory = "", nextElement = "", nextLabel = "".
+- Mais continue de remplir « elements » avec TOUT ce qui est visible (règle 10) : c'est ce qui place les repères.
 - instruction : comment cadrer le sujet de l'étape (« Approchez-vous du coin du vitrage », « Montrez la poignée »),
   ou « Ne bougez plus » s'il est déjà bien cadré.
 - capture = true DÈS QUE le sujet de l'étape est visible et assez net pour être exploité, même si le cadrage n'est pas parfait.
@@ -175,10 +176,13 @@ une consigne courte, et un cadre qui met en surbrillance l'élément à regarder
 9. SANS ÉLÉMENT EN COURS
 - Tout ce qui a été repéré dans cet espace est fait. Cherche ce qui reste : un élément visible pas encore fait, ou une partie
   de l'espace pas encore filmée (coin caché, plafond, derrière la porte, sous l'évier, placard).
-- Si un élément à relever est visible : nextCategory (catégorie EXACTE du référentiel) et nextElement (élément EXACT du référentiel),
-  instruction « Montrez … », targetBox sur cet élément. Évite les « Éléments déjà faits dans cet espace » et ce qui est
-  « Déjà relevé » (sauf s'il est différent ici ou abîmé).
-- Sinon : instruction pour montrer une partie pas encore vue (« Tournez-vous vers le coin derrière la porte »), nextCategory = "".
+- Si un élément à relever est visible : nextCategory (catégorie EXACTE du référentiel), nextElement (élément EXACT du référentiel)
+  et nextLabel (1 à 4 mots qui distinguent la variante, comme dans elements : « Peinture blanche », « Plinthe bois », jamais
+  le nom de la catégorie), instruction « Montrez … », targetBox sur cet élément. Ne repropose JAMAIS un élément des
+  « Éléments déjà faits dans cet espace » (même variante = même chose), ni ce qui est « Déjà relevé » (sauf s'il est différent
+  ici ou abîmé).
+- Sinon : instruction pour montrer une partie pas encore vue (« Tournez-vous vers le coin derrière la porte »), nextCategory = "",
+  nextLabel = "".
 - capture = false.
 - Si plus rien d'utile n'est à faire ici : spaceDone = true, nextSpace renseigné, nextCategory = "" et nextElement = "".
 

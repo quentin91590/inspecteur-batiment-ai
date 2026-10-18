@@ -166,6 +166,8 @@ export interface GuideResult {
   /** Sans séquence en cours : prochain élément proposé (catégorie et élément exacts du référentiel) */
   nextCategory: string;
   nextElement: string;
+  /** Libellé de la variante proposée (« Peinture blanche ») */
+  nextLabel: string;
   /** Tous les éléments du référentiel visibles à l'image, avec leur cadre */
   elements: VisibleElement[];
 }

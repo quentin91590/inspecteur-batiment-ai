@@ -239,6 +239,7 @@ export function normalizeGuide(parsed: unknown): GuideResult {
     stepAbsent: g.stepAbsent === true || g.stepAbsent === 'true',
     nextCategory: clip(g.nextCategory, 80),
     nextElement: clip(g.nextElement, 120),
+    nextLabel: clip(g.nextLabel, 60),
     elements: Array.isArray(g.elements)
       ? (g.elements as any[])
           .filter(e => e && e.category && (e.label || e.element))

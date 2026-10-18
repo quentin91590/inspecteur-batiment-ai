@@ -183,6 +183,19 @@ const boxFromArray = (b: number[]): NormBox => ({ cx: (b[1] + b[3]) / 2000, cy: 
 /** Cadre lu sur une image recadrée (zoom numérique d) → cadre dans l'image vidéo complète. */
 const uncrop = (b: NormBox, d: number): NormBox =>
   d <= 1.001 ? b : { cx: 0.5 + (b.cx - 0.5) / d, cy: 0.5 + (b.cy - 0.5) / d, w: b.w / d, h: b.h / d };
+/** Nom du référentiel le plus proche (l'IA écrit parfois « Menuiseries » pour « Menuiserie », sans accent…). */
+const resolveKey = (keys: string[], name: string): string | null => {
+  if (!name) return null;
+  const n = normText(name);
+  return (
+    keys.find(k => k === name) ??
+    keys.find(k => normText(k) === n) ??
+    keys.find(k => normText(k).startsWith(n) || n.startsWith(normText(k))) ??
+    keys.find(k => normText(k).includes(n) || n.includes(normText(k))) ??
+    null
+  );
+};
+
 const clampNum = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
 /** Zoom de la caméra : matériel si le téléphone le permet (meilleure netteté), sinon numérique. */
@@ -230,7 +243,7 @@ export const GuidedVisit: React.FC<Props> = ({
   const [blockMsg, setBlockMsg] = useState('');
   const [toast, setToast] = useState('');
   const [instruction, setInstruction] = useState<InstructionState | null>(null);
-  const [localHint, setLocalHint] = useState<'mouvement' | 'sombre' | null>(null);
+  const [localHint, setLocalHint] = useState<'sombre' | null>(null);
   const [pendingCapture, setPendingCapture] = useState(false);
   const [flashKey, setFlashKey] = useState(0);
   const [captures, setCaptures] = useState<SessionCapture[]>([]);
@@ -256,7 +269,12 @@ export const GuidedVisit: React.FC<Props> = ({
   const [speechHint, setSpeechHint] = useState(false);
   const [spokenSent, setSpokenSent] = useState(false);
   const [autoCapture, setAutoCapture] = useState(readAutoCapture);
-  const [ready, setReady] = useState(false);
+  const [ready, setReadyState] = useState(false);
+  const readyRef = useRef(false);
+  const setReady = (v: boolean) => {
+    readyRef.current = v;
+    setReadyState(v);
+  };
   const [checks, setChecks] = useState<Record<string, CheckStatus>>({});
   const [zoomShown, setZoomShown] = useState(1);
   const [refusedCaptures, setRefusedCaptures] = useState<string[]>([]);
@@ -312,6 +330,8 @@ export const GuidedVisit: React.FC<Props> = ({
   const pinElsRef = useRef(new Map<string, HTMLDivElement>());
   const onPinTapRef = useRef<(id: string) => void>(() => undefined);
   const chipsRef = useRef<HTMLDivElement>(null);
+  const topBarRef = useRef<HTMLDivElement>(null);
+  const bottomZoneRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef<ZoomState>({ hw: 1, hwCaps: null, digital: 1, applying: false });
   const roomsRef = useRef(new Map<string, RoomState>());
 
@@ -545,6 +565,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
   // ---------------------------------------------------------------- micro (dictée continue)
   const speechSupported = typeof window !== 'undefined' && !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+  const isFirefox = typeof navigator !== 'undefined' && /firefox|fxios/i.test(navigator.userAgent);
 
   const stopSpeech = useCallback(() => {
     micActiveRef.current = false;
@@ -655,6 +676,63 @@ export const GuidedVisit: React.FC<Props> = ({
   useEffect(() => {
     if (isOffline) setNetMode('offline');
   }, [isOffline]);
+
+  // Retour dans l'appli (sélecteur d'applis, écran verrouillé) : le navigateur a pu couper la caméra.
+  // On vérifie que l'image avance encore ; sinon on rouvre la caméra toute seule.
+  const restartingRef = useRef(false);
+  useEffect(() => {
+    if (phase !== 'running') return;
+    let lastTime = -1;
+    let frozenChecks = 0;
+    let sawProgress = false; // on ne juge « figée » qu'une image qu'on a déjà vue avancer
+    const restart = async () => {
+      if (restartingRef.current) return;
+      restartingRef.current = true;
+      sawProgress = false;
+      lastTime = -1;
+      try {
+        stopCamera();
+        if (lightRef.current === 'torch') setLight('off'); // la lampe s'éteint avec l'ancienne caméra
+        await startCamera();
+      } finally {
+        restartingRef.current = false;
+      }
+    };
+    const check = () => {
+      if (document.hidden || restartingRef.current) return;
+      const video = videoRef.current;
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (!video || !streamRef.current) return;
+      if (!track || track.readyState === 'ended') {
+        void restart();
+        return;
+      }
+      if (video.paused) void video.play().catch(() => undefined);
+      // Image figée (piste coupée sans être terminée) : deux contrôles de suite → on relance
+      if (lastTime >= 0 && video.currentTime > lastTime) sawProgress = true;
+      if (sawProgress && video.currentTime === lastTime) frozenChecks++;
+      else frozenChecks = 0;
+      lastTime = video.currentTime;
+      if (frozenChecks >= 2) {
+        frozenChecks = 0;
+        void restart();
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      lastTime = -1;
+      frozenChecks = 0;
+      window.setTimeout(check, 600);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', onVisible);
+    const id = window.setInterval(check, 1500);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', onVisible);
+      window.clearInterval(id);
+    };
+  }, [phase, startCamera, stopCamera]);
 
   // Pincer l'image = zoomer la caméra. Le zoom de la page est bloqué pendant la visite.
   useEffect(() => {
@@ -820,14 +898,19 @@ export const GuidedVisit: React.FC<Props> = ({
     const now = Date.now();
     let changed = false;
     for (const e of elements) {
-      if (!sch[e.category] || NON_VISUAL_CATEGORIES.includes(e.category)) continue;
-      if (th !== ALL_ZONES && e.category !== th) continue;
-      if (e.box.length !== 4 || !e.label) continue;
+      const category = resolveKey(Object.keys(sch), e.category);
+      if (!category || NON_VISUAL_CATEGORIES.includes(category)) continue;
+      if (th !== ALL_ZONES && category !== th) continue;
+      if (e.box.length !== 4) continue;
+      const element = resolveKey(Object.keys(sch[category]), e.element) ?? e.element;
+      // Jamais le nom de la catégorie comme libellé (« Substance & Surface ») : on prend l'élément
+      const label = e.label && !sameText(e.label, category) ? e.label : element;
+      if (!label) continue;
       const box = uncrop(boxFromArray(e.box), zoom.d);
       const dir = pose ? unproject(box.cx, box.cy, pose, fov) : null;
       const pts = pointsRef.current;
-      let pt = pts.find(q => q.category === e.category && sameText(q.label, e.label));
-      if (!pt && dir) pt = pts.find(q => q.category === e.category && q.element === e.element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
+      let pt = pts.find(q => q.category === category && sameText(q.label, label));
+      if (!pt && dir) pt = pts.find(q => q.category === category && q.element === element && !!q.dir && angleBetween(q.dir, dir) < SAME_DIR_DEG);
       if (pt) {
         if (dir && (!pt.dir || pt.status === 'todo')) pt.dir = dir;
         pt.box = box;
@@ -835,7 +918,7 @@ export const GuidedVisit: React.FC<Props> = ({
         continue;
       }
       if (pts.length >= MAX_POINTS) continue;
-      addPoint({ category: e.category, element: e.element, label: e.label, dir, box });
+      addPoint({ category, element, label, dir, box });
       changed = true;
     }
     if (changed) syncPoints();
@@ -1089,6 +1172,8 @@ export const GuidedVisit: React.FC<Props> = ({
     const crop = zoomRef.current.digital;
     const hd = grabJpeg(video, HD_MAX_SIDE, 0.82, filter, crop);
     const thumb = grabJpeg(video, 200, 0.6, filter, crop);
+    // Image plus légère pour le contrôle rapide de la photo (prise au même instant)
+    const checkImg = origin === 'manuel' && stepAtCapture ? grabJpeg(video, 1024, 0.78, filter, crop) : null;
     if (!hd || !thumb) return;
     capturingRef.current = true;
     const id = newId();
@@ -1120,7 +1205,7 @@ export const GuidedVisit: React.FC<Props> = ({
         /* pas de vibreur */
       }
       if (stepAtCapture && activeRef.current && activeRef.current.runId === stepAtCapture.runId && activeRef.current.stepIdx === stepAtCapture.stepIdx) {
-        if (origin === 'manuel') verifyStepPhoto(hd, stepAtCapture, stepAtCapture.stepIdx, id);
+        if (origin === 'manuel') verifyStepPhoto(checkImg ?? hd, stepAtCapture, stepAtCapture.stepIdx, id);
         advanceStep('photo');
       } else {
         showToast(origin === 'auto' ? 'Photo enregistrée (hors réseau)' : `Photo prise${requested ? ` : ${requested}` : ''}`);
@@ -1144,6 +1229,7 @@ export const GuidedVisit: React.FC<Props> = ({
     const video = videoRef.current;
     if (!video) return;
     const zoomAtSend = { hw: zoomRef.current.hw, d: zoomRef.current.digital };
+    const stableAtSend = stableTicksRef.current >= 2;
     const image = grabJpeg(video, GUIDE_MAX_SIDE, 0.6, lightRef.current === 'boost' ? LOW_LIGHT_FILTER : undefined, zoomAtSend.d);
     if (!image) return;
 
@@ -1214,7 +1300,7 @@ export const GuidedVisit: React.FC<Props> = ({
       const staleStep = !!activeAtSend && !sameStep;
 
       // Photo manuelle : l'IA signale que c'est bien cadré, l'inspecteur déclenche
-      const readyNow = sameStep && guide.capture && !autoCaptureRef.current;
+      const readyNow = sameStep && guide.capture && !autoCaptureRef.current && stableAtSend && stableTicksRef.current >= 1;
       if (sameStep) setReady(readyNow);
       if (!staleStep) {
         setInstruction({
@@ -1263,16 +1349,30 @@ export const GuidedVisit: React.FC<Props> = ({
         if (next) {
           startPoint(next);
           started = 'point';
-        } else if (canStart && guide.nextCategory && propsRef.current.schema[guide.nextCategory]) {
+        } else if (canStart && guide.nextCategory) {
           // Rien de repéré à faire : l'IA propose un élément
-          const proposed = protocolFor(guide.nextCategory, guide.nextElement);
-          const label = (guide.target.split('—')[0] ?? '').trim() || proposed.title;
-          const known = pointsRef.current.find(pt => sameText(pt.label, label));
-          if (!known && !doneHereRef.current.some(t => sameText(t, label))) {
+          const sch = propsRef.current.schema;
+          const category = resolveKey(Object.keys(sch), guide.nextCategory);
+          if (category && !NON_VISUAL_CATEGORIES.includes(category)) {
+            const element = resolveKey(Object.keys(sch[category]), guide.nextElement) ?? guide.nextElement;
             const box = guide.targetBox.length === 4 ? uncrop(boxFromArray(guide.targetBox), zoomAtSend.d) : null;
             const dir = box && poseAtSend ? unproject(box.cx, box.cy, poseAtSend, fieldOfView(videoDims.w || 16, videoDims.h || 9, zoomAtSend.hw)) : null;
-            startPoint(addPoint({ category: guide.nextCategory, element: guide.nextElement, label, dir, box }));
-            started = 'ai';
+            // Libellé : celui proposé, sinon l'élément du référentiel — jamais le nom de la catégorie
+            let label = guide.nextLabel || element || protocolFor(category, element).title;
+            if (sameText(label, category)) label = element || protocolFor(category, element).title;
+            // Déjà repéré ici (même libellé, ou même élément au même endroit) : on ne crée pas de doublon
+            const same = pointsRef.current.find(
+              pt => sameText(pt.label, label) || (pt.category === category && pt.element === element && !!dir && !!pt.dir && angleBetween(pt.dir, dir) < 15),
+            );
+            if (same) {
+              if (same.status === 'todo') {
+                startPoint(same);
+                started = 'point';
+              }
+            } else if (!doneHereRef.current.some(t => sameText(t, label))) {
+              startPoint(addPoint({ category, element, label, dir, box }));
+              started = 'ai';
+            }
           }
         }
       }
@@ -1329,7 +1429,12 @@ export const GuidedVisit: React.FC<Props> = ({
     }
     const stable = stableTicksRef.current >= 2;
     const dark = meanLuma(small) < DARK_LUMA && lightRef.current === 'off';
-    setLocalHint(dark ? 'sombre' : movingSinceRef.current && now - movingSinceRef.current > 1500 ? 'mouvement' : null);
+    setLocalHint(dark ? 'sombre' : null);
+    // « Bien cadré » ne vaut que tant qu'on ne bouge pas
+    if (readyRef.current && movingSinceRef.current && now - movingSinceRef.current > 350) {
+      readyRef.current = false;
+      setReady(false);
+    }
 
     if (pausedRef.current) return;
 
@@ -1397,6 +1502,22 @@ export const GuidedVisit: React.FC<Props> = ({
       if (el && el.style.display !== 'none') el.style.display = 'none';
     };
 
+    // Zone de l'image non couverte par la barre du haut et le panneau du bas (mesurée régulièrement)
+    let zone = { top: 80, bottom: 600, at: 0 };
+    const visibleZone = (vh: number) => {
+      const t = performance.now();
+      if (t - zone.at > 250) {
+        const topEl = topBarRef.current;
+        const botEl = bottomZoneRef.current;
+        zone = {
+          top: topEl ? topEl.getBoundingClientRect().bottom + 6 : 80,
+          bottom: botEl ? botEl.getBoundingClientRect().top - 6 : vh - 260,
+          at: t,
+        };
+      }
+      return zone;
+    };
+
     /** Image vidéo (0-1) → écran, avec l'agrandissement du zoom numérique autour du centre. */
     const toScreen = (cx: number, cy: number, vdim: { w: number; h: number }, vw: number, vh: number) => {
       const p = videoToScreen(cx, cy, vdim, { w: vw, h: vh });
@@ -1439,8 +1560,7 @@ export const GuidedVisit: React.FC<Props> = ({
       const fov = fieldOfView(vdim.w, vdim.h, zoomRef.current.hw);
       const now = Date.now();
       const activeId = activeRef.current?.pointId;
-      const top = Math.min(240, vh * 0.32);
-      const bottom = vh - Math.min(260, vh * 0.34);
+      const { top, bottom } = visibleZone(vh);
       const placed: { x: number; y: number }[] = [];
       // À faire d'abord : en cas de chevauchement, c'est leur nom qui reste lisible
       const order = [...pts].sort((a, b) => (a.status === 'todo' ? 0 : 1) - (b.status === 'todo' ? 0 : 1));
@@ -1464,7 +1584,7 @@ export const GuidedVisit: React.FC<Props> = ({
         if (pose && pt.dir) {
           const pr = project(pt.dir, pose, fov);
           const sc = toScreen(pr.cx, pr.cy, vdim, vw, vh);
-          if (!pr.behind && sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
+          if (!pr.behind && sc.x > 6 && sc.x < vw - 6 && sc.y > top && sc.y < bottom) {
             x = sc.x;
             y = sc.y;
             visible = true;
@@ -1486,7 +1606,7 @@ export const GuidedVisit: React.FC<Props> = ({
           }
         } else if (pt.box && now - pt.seenAt < RECENT_BOX_MS) {
           const sc = toScreen(pt.box.cx, pt.box.cy, vdim, vw, vh);
-          if (sc.x > 6 && sc.x < vw - 6 && sc.y > 6 && sc.y < vh - 6) {
+          if (sc.x > 6 && sc.x < vw - 6 && sc.y > top && sc.y < bottom) {
             x = sc.x;
             y = sc.y;
             visible = true;
@@ -1537,13 +1657,23 @@ export const GuidedVisit: React.FC<Props> = ({
       const vh = view.clientHeight;
       const state: ARState = tracker.update(vdim, gray, zoomRef.current.hw);
 
+      const zoneNow = visibleZone(vh);
+      let arrowTo: { dx: number; dy: number; behind: boolean } | null = null;
       if (state.kind === 'box') {
-        // Petit repère posé sur l'élément (centre du cadre), qui suit l'élément en direct
+        // Repère posé sur la partie visible de l'élément (un sol ou un mur peut dépasser sous le panneau du bas)
         const c = toScreen(state.box.cx, state.box.cy, vdim, vw, vh);
-        const onScreen = c.x > 8 && c.x < vw - 8 && c.y > 8 && c.y < vh - 8;
+        const r1 = toScreen(state.box.cx - state.box.w / 2, state.box.cy - state.box.h / 2, vdim, vw, vh);
+        const r2 = toScreen(state.box.cx + state.box.w / 2, state.box.cy + state.box.h / 2, vdim, vw, vh);
+        const minY = Math.max(zoneNow.top + 76, Math.min(c.y, r1.y));
+        const maxY = Math.min(zoneNow.bottom - 10, Math.max(c.y, r2.y));
+        const minX = Math.max(12, Math.min(c.x, r1.x));
+        const maxX = Math.min(vw - 12, Math.max(c.x, r2.x));
+        const onScreen = minY <= maxY && minX <= maxX;
         if (onScreen) {
+          const px = Math.min(Math.max(c.x, minX), maxX);
+          const py = Math.min(Math.max(c.y, minY), maxY);
           box.style.display = 'block';
-          box.style.transform = `translate(${c.x}px, ${c.y}px)`;
+          box.style.transform = `translate(${px}px, ${py}px)`;
           box.classList.toggle('ar-weak', !state.confident);
           const lab = boxLabelRef.current;
           if (lab) {
@@ -1551,14 +1681,15 @@ export const GuidedVisit: React.FC<Props> = ({
             if (lab.textContent !== short) lab.textContent = short;
             // Étiquette gardée dans l'écran
             const lw = lab.offsetWidth;
-            const shift = Math.min(Math.max(c.x - lw / 2, 8), vw - 8 - lw) - (c.x - lw / 2);
+            const shift = Math.min(Math.max(px - lw / 2, 8), vw - 8 - lw) - (px - lw / 2);
             lab.style.transform = `translateX(calc(-50% + ${shift}px))`;
           }
           hide(arrow);
           return;
         }
+        // Élément entièrement caché par le haut ou le bas de l'écran : flèche vers lui
         hide(box);
-        return;
+        arrowTo = { dx: c.x - vw / 2, dy: c.y - (zoneNow.top + zoneNow.bottom) / 2, behind: false };
       }
 
       hide(box);
@@ -1570,22 +1701,27 @@ export const GuidedVisit: React.FC<Props> = ({
       let dx: number;
       let dy: number;
       let behind = false;
-      if (state.kind === 'offscreen') {
+      if (arrowTo) {
+        ({ dx, dy, behind } = arrowTo);
+      } else if (state.kind === 'offscreen') {
         const c = toScreen(0.5 + state.dx, 0.5 + state.dy, vdim, vw, vh);
         dx = c.x - vw / 2;
         dy = c.y - vh / 2;
         behind = state.behind;
         if (behind) dy = 0;
-      } else {
+      } else if (state.kind === 'hint') {
         [dx, dy] = HINT_VECTOR[state.direction];
         behind = state.direction === 'derriere';
+      } else {
+        hide(arrow);
+        return;
       }
       const len = Math.hypot(dx, dy) || 1;
       const ux = dx / len;
       const uy = dy / len;
-      // Zone utile entre le haut (consigne) et le bas (commandes)
-      const top = Math.min(240, vh * 0.32);
-      const bottom = vh - Math.min(260, vh * 0.34);
+      // Zone utile entre la barre du haut et le panneau du bas
+      const top = zoneNow.top + 30;
+      const bottom = zoneNow.bottom - 30;
       const left = 44;
       const right = vw - 44;
       const cx = vw / 2;
@@ -1596,7 +1732,7 @@ export const GuidedVisit: React.FC<Props> = ({
       arrow.style.display = 'flex';
       arrow.style.transform = `translate(${cx + ux * t}px, ${cy + uy * t}px) translate(-50%, -50%)`;
       if (arrowIconRef.current) arrowIconRef.current.style.transform = `rotate(${Math.atan2(uy, ux)}rad)`;
-      const text = behind ? `${state.label} · derrière vous` : state.label;
+      const text = behind ? `${tracker.currentLabel} · derrière vous` : tracker.currentLabel;
       const lab = arrowLabelRef.current;
       if (lab) {
         if (lab.textContent !== text) lab.textContent = text;
@@ -1664,13 +1800,23 @@ export const GuidedVisit: React.FC<Props> = ({
       });
       setPhase('running');
       setMicOn(speechSupported);
-      flashSpeechHint();
+      flashSpeechHint(true);
       setStats(s => ({ ...s, startedAt: Date.now() }));
       void startCamera();
     }
   };
 
-  const flashSpeechHint = () => {
+  /** Astuce sur la dictée : au démarrage, une seule fois par téléphone ; à chaque fois qu'on rallume le micro. */
+  const flashSpeechHint = (onceOnly = false) => {
+    const key = `inspecteur.speechHint.${speechSupported ? 'ok' : 'ko'}`;
+    if (onceOnly) {
+      try {
+        if (localStorage.getItem(key)) return;
+        localStorage.setItem(key, '1');
+      } catch {
+        /* stockage indisponible : on montre l'astuce */
+      }
+    }
     setSpeechHint(true);
     window.setTimeout(() => setSpeechHint(false), SPEECH_HINT_MS);
   };
@@ -1957,16 +2103,18 @@ export const GuidedVisit: React.FC<Props> = ({
                   icon: micOn ? <Mic size={15} className="text-rose-300" /> : <MicOff size={15} />,
                   text: micOn
                     ? 'Parlez pour préciser : « fenêtre de 1985 », « pas de store ici »…'
-                    : speechSupported ? 'Dictée coupée : touchez le micro pour parler à l’IA' : 'Dictée vocale non disponible sur ce navigateur',
+                    : speechSupported
+                      ? 'Dictée coupée : touchez le micro pour parler à l’IA'
+                      : isFirefox
+                        ? 'Firefox n’a pas de dictée vocale : ouvrez l’appli dans Chrome pour parler à l’IA'
+                        : 'Dictée vocale non disponible sur ce navigateur',
                   testid: 'speech-hint',
                 }
               : micMsg
                 ? { tone: 'bg-amber-400 text-black', icon: <MicOff size={15} />, text: micMsg, testid: 'mic-message' }
                 : localHint === 'sombre'
                     ? { tone: 'bg-amber-400 text-black', icon: <Sun size={16} />, text: 'Image sombre : touchez la lampe en haut', testid: 'dark-hint' }
-                    : localHint === 'mouvement'
-                      ? { tone: 'bg-black/70 text-white', text: 'Ralentissez pour que l’IA voie bien', testid: 'motion-hint' }
-                      : null;
+                    : null;
 
   // État de chaque photo à prendre (puces du panneau du bas)
   const chipState = (i: number): 'current' | 'refused' | 'checking' | 'done' | 'skipped' | 'todo' => {
@@ -2053,7 +2201,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
       {/* Haut : une seule ligne */}
       <div className="absolute top-0 inset-x-0 z-10 bg-gradient-to-b from-black/55 to-transparent px-3 pb-5 safe-top">
-        <div className="flex items-center gap-2 pt-1">
+        <div ref={topBarRef} className="flex items-center gap-2 pt-1">
           <button onClick={finishVisit} className="p-2.5 rounded-full bg-black/40" aria-label="Terminer la visite">
             <X size={20} />
           </button>
@@ -2131,6 +2279,7 @@ export const GuidedVisit: React.FC<Props> = ({
 
       {/* Bas : message, consigne, déclencheur */}
       <div className="absolute bottom-0 inset-x-0 z-10 bg-gradient-to-t from-black/70 via-black/30 to-transparent pt-8 safe-bottom">
+        <div ref={bottomZoneRef} />
         {zoomShown > 1.04 && (
           <div className="flex justify-center mb-2">
             <button

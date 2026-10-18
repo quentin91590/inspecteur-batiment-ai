@@ -61,6 +61,7 @@ export const GUIDE_SCHEMA: JsonSchema = {
     stepAbsent: { type: 'boolean', description: 'true si l’étape facultative en cours n’existe pas ici' },
     nextCategory: { type: 'string', description: 'Sans élément en cours : catégorie exacte du prochain élément, sinon chaîne vide' },
     nextElement: { type: 'string', description: 'Sans élément en cours : élément exact du référentiel, sinon chaîne vide' },
+    nextLabel: { type: 'string', description: 'Libellé court de la variante proposée (« Peinture blanche »), sinon chaîne vide' },
     elements: {
       type: 'array',
       description: 'Tous les éléments du référentiel visibles, une entrée par variante distincte (10 maximum)',
@@ -90,7 +91,7 @@ export const GUIDE_SCHEMA: JsonSchema = {
       },
     },
   },
-  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'space', 'spaceDone', 'nextSpace', 'targetBox', 'targetDirection', 'stepAbsent', 'nextCategory', 'nextElement', 'elements', 'seen'],
+  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'space', 'spaceDone', 'nextSpace', 'targetBox', 'targetDirection', 'stepAbsent', 'nextCategory', 'nextElement', 'nextLabel', 'elements', 'seen'],
   additionalProperties: false,
 };
 

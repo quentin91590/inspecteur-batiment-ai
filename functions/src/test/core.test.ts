@@ -193,11 +193,13 @@ describe('guidage spatial et surbrillance', () => {
 
   it('sans élément en cours : l’IA propose le prochain élément', async () => {
     captured.length = 0;
-    nextReply = () => geminiReply({ ...GUIDE_OK, nextCategory: 'Chauffage', nextElement: 'Emetteur', stepAbsent: false });
+    nextReply = () => geminiReply({ ...GUIDE_OK, nextCategory: 'Chauffage', nextElement: 'Emetteur', nextLabel: 'Radiateur fonte', stepAbsent: false });
     const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [] }, 'u1', deps());
     assert.match(captured[0].body.contents[0].parts[1].text, /AUCUN ÉLÉMENT EN COURS/);
     assert.equal(res.guide?.nextCategory, 'Chauffage');
     assert.equal(res.guide?.nextElement, 'Emetteur');
+    assert.equal(res.guide?.nextLabel, 'Radiateur fonte');
+    assert.ok(captured[0].body.generationConfig.responseJsonSchema.required.includes('nextLabel'));
   });
 
   it('cadres : échelle 0-1 corrigée, cadres incohérents rejetés', () => {
@@ -233,6 +235,7 @@ describe('guidage spatial et surbrillance', () => {
     assert.match(text, /Éléments déjà faits dans cet espace : Radiateur fonte/);
     assert.doesNotMatch(text, /AUCUN ÉLÉMENT EN COURS/);
     assert.match(captured[0].body.systemInstruction.parts[0].text, /REPÉRAGE DES ÉLÉMENTS \(à CHAQUE image/);
+    assert.match(captured[0].body.systemInstruction.parts[0].text, /continue de remplir « elements »/);
     assert.deepEqual(res.guide?.elements, [
       { category: 'Chauffage', element: 'Boiler', label: 'Boiler blanc', box: [100, 200, 500, 600] },
       { category: 'Chauffage', element: 'Production de chaleur', label: 'Production de chaleur', box: [100, 100, 300, 300] },

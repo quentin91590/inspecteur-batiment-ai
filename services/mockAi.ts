@@ -102,6 +102,7 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
         stepAbsent: false,
         nextCategory: '',
         nextElement: '',
+        nextLabel: '',
         elements: demoElements(req.missing, req.elementsDoneHere ?? []),
       };
       if (!req.currentSpace && !(req.spacesVisited ?? []).length) demoSpace = ''; // nouvelle visite
@@ -134,7 +135,7 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
             capture: ready,
             stepAbsent: absent,
             space,
-            targetBox: [320, 300, 600, 700],
+            targetBox: ((globalThis as any).__demoTargetBox as number[] | undefined) ?? [320, 300, 600, 700], // réglable pour les tests
             targetDirection: 'ici',
           },
           meta: meta(),
@@ -156,6 +157,7 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
           space,
           nextCategory: target.category,
           nextElement: target.subCategory,
+          nextLabel: target.subCategory,
           targetBox: [300, 250, 620, 750],
           targetDirection: 'ici',
         },
