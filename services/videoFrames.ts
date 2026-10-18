@@ -37,8 +37,11 @@ export function meanLuma(a: Uint8ClampedArray | null): number {
   return sum / a.length;
 }
 
-/** Image JPEG (data URL) de la vidéo, plus grand côté limité à maxSide. */
-export function grabJpeg(video: HTMLVideoElement, maxSide: number, quality: number): string | null {
+/** Éclaircissement appliqué quand la lampe n'est pas disponible (mode faible lumière). */
+export const LOW_LIGHT_FILTER = 'brightness(1.75) contrast(1.12)';
+
+/** Image JPEG (data URL) de la vidéo, plus grand côté limité à maxSide ; filter = éclaircissement éventuel. */
+export function grabJpeg(video: HTMLVideoElement, maxSide: number, quality: number, filter?: string): string | null {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   if (!vw || !vh) return null;
@@ -48,6 +51,31 @@ export function grabJpeg(video: HTMLVideoElement, maxSide: number, quality: numb
   canvas.height = Math.round(vh * scale);
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
+  if (filter) ctx.filter = filter;
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/jpeg', quality);
+}
+
+let trackCanvas: HTMLCanvasElement | null = null;
+
+/** Image en niveaux de gris (~240 px de grand côté) pour le suivi de l'élément visé. */
+export function grayFrame(video: HTMLVideoElement, longSide = 240): { data: Uint8ClampedArray; w: number; h: number } | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const s = longSide / Math.max(vw, vh);
+  const w = Math.max(16, Math.round(vw * s));
+  const h = Math.max(16, Math.round(vh * s));
+  trackCanvas ??= document.createElement('canvas');
+  trackCanvas.width = w;
+  trackCanvas.height = h;
+  const ctx = trackCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, w, h);
+  const { data } = ctx.getImageData(0, 0, w, h);
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    gray[j] = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+  }
+  return { data: gray, w, h };
 }

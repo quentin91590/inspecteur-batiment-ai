@@ -35,20 +35,38 @@ export interface SummarizeRequest {
   model?: string;
 }
 
+/** libre = l'inspecteur commence où il est ; parcours = l'IA propose un ordre de visite */
+export type VisitMode = 'libre' | 'parcours';
+
 export interface GuideRequest {
   task: 'guide';
   /** Image basse définition de la caméra (JPEG base64, sans préfixe) */
   image: string;
   schema: SchemaDefinition;
-  /** Zone en cours (catégorie du référentiel) ou « Tout le bâtiment » */
-  zone: string;
-  /** Lignes « Catégorie / Élément : ce qui manque » */
+  mode?: VisitMode;
+  /** Thème : « Tout le bâtiment » ou une catégorie du référentiel */
+  theme?: string;
+  /** Ancien nom de « theme » (V2.0) */
+  zone?: string;
+  /** Parcours : étape en cours et suivante */
+  stage?: string;
+  nextStage?: string;
+  /** Espace reconnu aux images précédentes, et espaces déjà parcourus */
+  currentSpace?: string;
+  spacesVisited?: string[];
+  /** L'inspecteur a fini l'espace actuel et demande où aller */
+  requestNextSpace?: boolean;
+  /** Lignes « Catégorie : élément (ce qui manque) » */
   missing: string[];
+  /** Éléments déjà documentés avec leurs valeurs */
+  recorded?: string[];
   /** Éléments déjà capturés dont l'analyse HD est en cours */
   inProgress: string[];
   /** Ce que l'inspecteur a dit depuis la dernière image */
   transcript?: string;
   lastInstruction?: string;
+  /** Élément visé à l'image précédente (pour garder la même cible) */
+  lastTarget?: string;
   model?: string;
 }
 
@@ -75,6 +93,8 @@ export interface RawElement {
 
 export type SceneQuality = 'ok' | 'sombre' | 'flou' | 'loin' | 'proche' | 'hors_sujet';
 
+export type TargetDirection = 'ici' | 'gauche' | 'droite' | 'haut' | 'bas' | 'derriere' | 'inconnu';
+
 export interface GuideResult {
   instruction: string;
   detail: string;
@@ -83,6 +103,16 @@ export interface GuideResult {
   captureReason: string;
   sceneQuality: SceneQuality;
   seen: { category: string; subCategory: string }[];
+  /** Type d'espace reconnu (Chambre, Couloir, Chaufferie, Façade…) */
+  space: string;
+  /** Tout ce qui est utile dans cet espace est relevé */
+  spaceDone: boolean;
+  /** Espace suivant conseillé (quand spaceDone ou demandé) */
+  nextSpace: string;
+  /** Cadre de l'élément visé [ymin, xmin, ymax, xmax] de 0 à 1000 ; [] s'il n'est pas visible */
+  targetBox: number[];
+  /** Où chercher l'élément visé s'il n'est pas dans l'image */
+  targetDirection: TargetDirection;
 }
 
 export interface ModelInfo {

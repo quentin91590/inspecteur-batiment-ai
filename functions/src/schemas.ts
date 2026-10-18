@@ -49,6 +49,15 @@ export const GUIDE_SCHEMA: JsonSchema = {
     capture: { type: 'boolean', description: 'true pour déclencher une photo haute définition maintenant' },
     captureReason: { type: 'string' },
     sceneQuality: { type: 'string', enum: ['ok', 'sombre', 'flou', 'loin', 'proche', 'hors_sujet'] },
+    space: { type: 'string', description: 'Type d’espace où se trouve l’inspecteur (Chambre, Couloir, Chaufferie, Façade…)' },
+    spaceDone: { type: 'boolean', description: 'true si tout ce qui est utile dans cet espace est relevé' },
+    nextSpace: { type: 'string', description: 'Espace suivant conseillé, ou chaîne vide' },
+    targetBox: {
+      type: 'array',
+      description: 'Cadre de l’élément visé [ymin, xmin, ymax, xmax] normalisé de 0 à 1000 ; tableau vide s’il n’est pas visible',
+      items: { type: 'integer' },
+    },
+    targetDirection: { type: 'string', enum: ['ici', 'gauche', 'droite', 'haut', 'bas', 'derriere', 'inconnu'] },
     seen: {
       type: 'array',
       description: 'Éléments du référentiel clairement visibles sur l’image',
@@ -63,7 +72,7 @@ export const GUIDE_SCHEMA: JsonSchema = {
       },
     },
   },
-  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'seen'],
+  required: ['instruction', 'detail', 'target', 'capture', 'captureReason', 'sceneQuality', 'space', 'spaceDone', 'nextSpace', 'targetBox', 'targetDirection', 'seen'],
   additionalProperties: false,
 };
 

@@ -17,14 +17,13 @@ Application d'inspection de bâtiment : photos, notes vocales et **visite guidé
 
 ### Comment marche la visite guidée
 
-1. On choisit la zone (une catégorie du référentiel, ou tout le bâtiment).
-2. Toutes les ~2 s, **seulement si l'image est stable et a changé**, l'appli envoie une image réduite (768 px) avec :
-   - la liste de ce qui manque encore dans la zone,
-   - ce que l'inspecteur vient de dire (dictée du téléphone, gratuite),
-   - les photos déjà prises et en cours d'analyse (pour ne pas les redemander).
-3. Le modèle rapide renvoie une **consigne courte** (« Approchez-vous de la plaque de la chaudière ») et, quand un élément est bien cadré, demande une **photo HD**.
-4. La photo HD (1280 px) part dans la file d'analyse habituelle, avec les paroles prononcées : c'est le modèle « analyse » qui remplit les attributs.
-5. **Sans réseau** (chaufferie en sous-sol) : chaque nouvelle scène stable est photographiée et mise en file ; tout est analysé au retour du réseau. Rien n'est perdu même si l'appli est fermée.
+1. On choisit **« Commencer ici »** (l'IA reconnaît la pièce où l'on est) ou **« Parcours guidé »** (extérieur → entrée et communs → sous-sol et locaux techniques → logements et locaux → combles et toiture ; première consigne : « placez-vous face à l'entrée principale »). Un thème du référentiel peut limiter la visite (ex. Chauffage).
+2. Toutes les ~2 s, **seulement si l'image est stable et a changé**, l'appli envoie une image réduite (768 px) avec : l'espace actuel et ceux déjà parcourus, ce qui manque encore, ce qui est **déjà relevé** (avec ses valeurs), les photos en cours d'analyse et ce que l'inspecteur vient de dire.
+3. Le modèle renvoie une **consigne courte**, l'**espace reconnu** (Chambre, Couloir, Chaufferie…), et le **cadre de l'élément visé**. Règle principale : il guide dans l'espace où l'on se trouve et ne fait changer d'espace que si on touche **« Pièce suivante »** ou si l'espace est terminé, en proposant l'espace voisin le plus logique. Dans les grands bâtiments, il ne redemande pas ce qui est déjà relevé, sauf si c'est différent ici ou abîmé.
+4. **Surbrillance** : l'élément visé est encadré en jaune. Entre deux réponses, le cadre suit l'élément grâce au gyroscope du téléphone et à une recherche d'image ; s'il sort de l'écran, une flèche au bord indique où il est.
+5. Quand un élément est bien cadré, l'appli prend une **photo HD** (1280 px), analysée en détail avec les paroles prononcées.
+6. **Lampe** : bouton en haut à droite. La lampe du téléphone s'allume si le navigateur le permet (Chrome Android, Safari iOS 17.5+) ; sinon l'image est éclaircie, à l'écran et pour l'IA.
+7. **Sans réseau** : chaque nouvelle scène stable est photographiée et mise en file ; tout est analysé au retour du réseau.
 
 Crédits consommés (modifiables dans `constants.ts`, `AI_COSTS`) : 4 par minute de guidage, 8 par photo analysée.
 

@@ -22,3 +22,73 @@
 
 /* Évite qu'un élément trop large n'élargisse l'écran sur mobile (et ne décale la visite guidée) */
 html, body { overflow-x: hidden; }
+
+/* Surbrillance de l'élément visé (visite guidée) */
+.ar-box {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border: 3px solid #facc15;
+  border-radius: 16px;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35), 0 0 28px rgba(250, 204, 21, 0.55), inset 0 0 18px rgba(250, 204, 21, 0.25);
+  pointer-events: none;
+  z-index: 5;
+  will-change: transform;
+  animation: ar-pulse 1.4s ease-in-out infinite;
+}
+.ar-box.ar-weak { border-style: dashed; opacity: 0.7; animation: none; }
+.ar-label {
+  position: absolute;
+  left: -3px;
+  bottom: calc(100% + 6px);
+  max-width: 70vw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: #facc15;
+  color: #111827;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+@keyframes ar-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(0,0,0,.35), 0 0 18px rgba(250,204,21,.45), inset 0 0 12px rgba(250,204,21,.2); }
+  50% { box-shadow: 0 0 0 2px rgba(0,0,0,.35), 0 0 34px rgba(250,204,21,.8), inset 0 0 22px rgba(250,204,21,.35); }
+}
+.ar-arrow {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+  will-change: transform;
+}
+.ar-arrow-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 999px;
+  background: #facc15;
+  color: #111827;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.3), 0 0 22px rgba(250, 204, 21, 0.7);
+}
+.ar-arrow-label {
+  max-width: 46vw;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}

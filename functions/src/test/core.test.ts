@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { after, before, describe, it } from 'node:test';
-import { AiError, handleAiRequest, type CoreDeps } from '../core.js';
+import { AiError, handleAiRequest, normalizeBox, type CoreDeps } from '../core.js';
 import type { AiMeta, SchemaDefinition } from '../types.js';
 
 const SCHEMA: SchemaDefinition = {
@@ -127,6 +127,63 @@ describe('guidage', () => {
     assert.equal(res.guide?.sceneQuality, 'ok');
     assert.equal(res.guide?.capture, true);
     assert.deepEqual(res.guide?.seen, []);
+  });
+});
+
+describe('guidage spatial et surbrillance', () => {
+  it('transmet le mode, l’étape, l’espace, le déjà-relevé et la demande d’espace suivant', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply({ ...GUIDE_OK, space: 'Chambre', spaceDone: true, nextSpace: 'Couloir', targetBox: [400, 100, 700, 450], targetDirection: 'ici' });
+    const res = await handleAiRequest(
+      {
+        task: 'guide', image: IMG, schema: SCHEMA, mode: 'parcours', theme: 'Tout le bâtiment',
+        stage: 'Logements et locaux', nextStage: 'Combles et toiture',
+        currentSpace: 'Chambre', spacesVisited: ['Façade', 'Hall d’entrée', 'Chambre'], requestNextSpace: true,
+        missing: ['Chauffage : Boiler (pas vu)'], recorded: ['Chauffage / Emetteur : Etat=Bon'], inProgress: [],
+        lastTarget: 'Radiateur — sous la fenêtre',
+      },
+      'u1', deps(),
+    );
+    const text = captured[0].body.contents[0].parts[1].text as string;
+    assert.match(text, /Mode : Parcours guidé/);
+    assert.match(text, /Étape en cours : Logements et locaux \(étape suivante : Combles et toiture\)/);
+    assert.match(text, /Espace actuel \(images précédentes\) : Chambre/);
+    assert.match(text, /Façade → Hall d’entrée → Chambre/);
+    assert.match(text, /A TERMINÉ CET ESPACE/);
+    assert.match(text, /Déjà relevé[^]*Emetteur : Etat=Bon/);
+    assert.match(text, /Élément visé précédemment : « Radiateur — sous la fenêtre »/);
+    const sys = captured[0].body.systemInstruction.parts[0].text as string;
+    assert.match(sys, /INTERDIT de demander d'aller dans un autre espace/);
+    assert.deepEqual(res.guide?.targetBox, [400, 100, 700, 450]);
+    assert.equal(res.guide?.space, 'Chambre');
+    assert.equal(res.guide?.spaceDone, true);
+    assert.equal(res.guide?.nextSpace, 'Couloir');
+    assert.equal(res.guide?.targetDirection, 'ici');
+  });
+
+  it('ancienne requête (zone, sans mode) toujours acceptée, mode « Commencer ici »', async () => {
+    captured.length = 0;
+    nextReply = () => geminiReply(GUIDE_OK);
+    const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, zone: 'Chauffage', missing: [], inProgress: [] }, 'u1', deps());
+    const text = captured[0].body.contents[0].parts[1].text as string;
+    assert.match(text, /Mode : Commencer ici/);
+    assert.match(text, /Thème : Chauffage/);
+    assert.deepEqual(res.guide?.targetBox, []);
+    assert.equal(res.guide?.targetDirection, 'inconnu');
+  });
+
+  it('cadres : échelle 0-1 corrigée, cadres incohérents rejetés', () => {
+    assert.deepEqual(normalizeBox([0.1, 0.2, 0.5, 0.6]), [100, 200, 500, 600]);
+    assert.deepEqual(normalizeBox([100, 200, 500, 1200]), [100, 200, 500, 1000]);
+    assert.deepEqual(normalizeBox([500, 200, 100, 600]), []);
+    assert.deepEqual(normalizeBox([1, 2, 3]), []);
+    assert.deepEqual(normalizeBox('x'), []);
+  });
+
+  it('élément hors image : direction conservée, pas de cadre', async () => {
+    nextReply = () => geminiReply({ ...GUIDE_OK, targetBox: [], targetDirection: 'derrière' });
+    const res = await handleAiRequest({ task: 'guide', image: IMG, schema: SCHEMA, missing: [], inProgress: [] }, 'u1', deps());
+    assert.equal(res.guide?.targetDirection, 'derriere');
   });
 });
 

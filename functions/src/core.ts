@@ -19,6 +19,7 @@ import type {
   RawElement,
   SceneQuality,
   SchemaDefinition,
+  TargetDirection,
 } from './types.js';
 
 /** Réglages modifiables sans redéployer : document Firestore config/ai */
@@ -194,6 +195,19 @@ export function normalizeElements(parsed: unknown): RawElement[] {
 }
 
 const QUALITIES: SceneQuality[] = ['ok', 'sombre', 'flou', 'loin', 'proche', 'hors_sujet'];
+const DIRECTIONS: TargetDirection[] = ['ici', 'gauche', 'droite', 'haut', 'bas', 'derriere', 'inconnu'];
+
+/** Cadre [ymin, xmin, ymax, xmax] sur 0-1000, ou [] s'il est absent / incohérent. */
+export function normalizeBox(v: unknown): number[] {
+  if (!Array.isArray(v) || v.length !== 4) return [];
+  const n = v.map(x => (typeof x === 'number' ? x : parseFloat(String(x))));
+  if (n.some(x => !Number.isFinite(x))) return [];
+  // Certains modèles répondent en 0-1 : on remet à l'échelle
+  const scaled = n.every(x => x >= 0 && x <= 1) && n.some(x => x > 0) ? n.map(x => x * 1000) : n;
+  const [ymin, xmin, ymax, xmax] = scaled.map(x => Math.round(Math.min(1000, Math.max(0, x))));
+  if (ymax - ymin < 8 || xmax - xmin < 8) return [];
+  return [ymin, xmin, ymax, xmax];
+}
 
 export function normalizeGuide(parsed: unknown): GuideResult {
   const g = (parsed && typeof parsed === 'object' ? parsed : {}) as Record<string, unknown>;
@@ -205,6 +219,8 @@ export function normalizeGuide(parsed: unknown): GuideResult {
         .slice(0, 10)
         .map(s => ({ category: String(s.category), subCategory: String(s.subCategory) }))
     : [];
+  const direction = String(g.targetDirection ?? '').toLowerCase().replace('è', 'e') as TargetDirection;
+  const targetBox = normalizeBox(g.targetBox);
   return {
     instruction: clip(g.instruction, 140) || 'Continuez à filmer lentement',
     detail: clip(g.detail, 160),
@@ -213,6 +229,11 @@ export function normalizeGuide(parsed: unknown): GuideResult {
     captureReason: clip(g.captureReason, 160),
     sceneQuality: QUALITIES.includes(quality) ? quality : 'ok',
     seen,
+    space: clip(g.space, 60),
+    spaceDone: g.spaceDone === true || g.spaceDone === 'true',
+    nextSpace: clip(g.nextSpace, 80),
+    targetBox,
+    targetDirection: targetBox.length ? 'ici' : DIRECTIONS.includes(direction) ? direction : 'inconnu',
   };
 }
 
@@ -268,12 +289,22 @@ export async function handleAiRequest(data: unknown, uid: string, deps: CoreDeps
       params = {
         system: guideSystem(schemaOf(req.schema)),
         user: guideUser({
-          ...req,
-          zone: str(req.zone, 'zone', 200),
+          task: 'guide',
+          image: '',
+          schema: {},
+          mode: req.mode === 'parcours' ? 'parcours' : 'libre',
+          theme: str(req.theme ?? req.zone, 'theme', 200, false) || 'Tout le bâtiment',
+          stage: str(req.stage, 'stage', 200, false),
+          nextStage: str(req.nextStage, 'nextStage', 200, false),
+          currentSpace: str(req.currentSpace, 'currentSpace', 80, false),
+          spacesVisited: strList(req.spacesVisited, 30),
+          requestNextSpace: req.requestNextSpace === true,
           missing: strList(req.missing),
+          recorded: strList(req.recorded, 60),
           inProgress: strList(req.inProgress, 20),
           transcript: str(req.transcript, 'transcript', 1500, false),
           lastInstruction: str(req.lastInstruction, 'lastInstruction', 200, false),
+          lastTarget: str(req.lastTarget, 'lastTarget', 200, false),
         }),
         imageB64: image(req.image),
         schema: GUIDE_SCHEMA,

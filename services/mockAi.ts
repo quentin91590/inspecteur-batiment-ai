@@ -25,8 +25,9 @@ function pickValue(values: string[], seed: number): string {
   return real[seed % Math.max(1, real.length)] ?? values[0];
 }
 
+/** « Chauffage : Boiler (pas vu), Emetteur (manque Etat) » → premier élément de la ligne */
 function parseMissingLine(line: string): { category: string; subCategory: string } | null {
-  const m = line.match(/^(.+?) \/ (.+?) :/);
+  const m = line.match(/^(.+?) : (.+?) \(/);
   return m ? { category: m[1].trim(), subCategory: m[2].trim() } : null;
 }
 
@@ -66,38 +67,48 @@ export async function handle(req: AiRequest): Promise<AiResponse> {
     case 'guide': {
       await wait(450 + Math.random() * 350);
       guideCounter++;
+      const base = {
+        detail: 'Consignes simulées (mode démo)',
+        captureReason: '',
+        sceneQuality: 'ok' as const,
+        seen: [] as { category: string; subCategory: string }[],
+        spaceDone: false,
+        nextSpace: '',
+        targetBox: [] as number[],
+        targetDirection: 'inconnu' as const,
+      };
+      const space = req.currentSpace || 'Pièce (démo)';
+      if (req.mode === 'parcours' && !(req.spacesVisited ?? []).length && !req.currentSpace) {
+        return { guide: { ...base, instruction: 'Placez-vous face à l’entrée principale, côté rue', target: 'Façade — entrée principale', capture: false, space: 'Abords' }, meta: meta() };
+      }
+      if (req.requestNextSpace) {
+        return {
+          guide: { ...base, instruction: 'Passez dans le couloir voisin', target: '', capture: false, space, spaceDone: true, nextSpace: 'Couloir (démo)', targetDirection: 'droite' },
+          meta: meta(),
+        };
+      }
       const target = req.missing.map(parseMissingLine).find(e => e && !req.inProgress.some(t => t.startsWith(e.subCategory)));
       if (!target) {
         return {
-          guide: {
-            instruction: 'Zone terminée : choisissez une autre zone',
-            detail: 'Tous les éléments de la zone sont relevés ou en cours d’analyse.',
-            target: '',
-            capture: false,
-            captureReason: '',
-            sceneQuality: 'ok',
-            seen: [],
-          },
+          guide: { ...base, instruction: 'Pièce terminée : passez à la suivante', target: '', capture: false, space, spaceDone: true, nextSpace: 'Couloir (démo)' },
           meta: meta(),
         };
       }
       const step = guideCounter % 3;
       const capture = step === 0;
       const label = target.subCategory.toLowerCase();
-      const instruction = capture
-        ? `Ne bougez plus : photo de ${label}`
-        : step === 1
-          ? `Montrez-moi ${label}`
-          : `Approchez-vous de ${label}`;
+      const instruction = capture ? `Ne bougez plus : photo de ${label}` : step === 1 ? `Montrez-moi ${label}` : `Approchez-vous de ${label}`;
       return {
         guide: {
+          ...base,
           instruction,
-          detail: 'Consignes simulées (mode démo)',
           target: `${target.subCategory} — vue d’ensemble`,
           capture,
           captureReason: capture ? 'Élément bien cadré' : '',
-          sceneQuality: 'ok',
           seen: capture ? [target] : [],
+          space,
+          targetBox: [300, 250, 620, 750],
+          targetDirection: 'ici',
         },
         meta: meta(),
       };
