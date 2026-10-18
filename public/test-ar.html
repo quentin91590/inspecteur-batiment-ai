@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Test AR précise</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b1220; color: #f1f5f9; }
+    main { max-width: 520px; margin: 0 auto; padding: 20px 16px 40px; }
+    h1 { font-size: 22px; margin: 4px 0 6px; }
+    p { color: #cbd5e1; line-height: 1.45; margin: 6px 0; }
+    .card { background: #111a2e; border: 1px solid #23304d; border-radius: 16px; padding: 14px 16px; margin-top: 14px; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #1d2742; font-size: 15px; }
+    .row:last-child { border-bottom: 0; }
+    .ok { color: #4ade80; font-weight: 700; }
+    .ko { color: #f87171; font-weight: 700; }
+    .wait { color: #fbbf24; font-weight: 700; }
+    button { width: 100%; margin-top: 14px; padding: 14px; border-radius: 14px; border: 0; font-size: 16px; font-weight: 700; background: #facc15; color: #111827; }
+    button:disabled { opacity: .4; }
+    #overlay { display: none; position: fixed; inset: 0; pointer-events: none; }
+    #overlay .panel { pointer-events: auto; position: absolute; left: 12px; right: 12px; bottom: 24px; background: rgba(0,0,0,.72); border-radius: 16px; padding: 12px 14px; }
+    #overlay .big { font-size: 26px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    #overlay .small { font-size: 13px; color: #cbd5e1; margin-top: 4px; }
+    #overlay button { margin-top: 10px; padding: 10px; background: #fff; }
+    #trail { position: absolute; top: 20px; right: 12px; width: 150px; height: 150px; background: rgba(0,0,0,.55); border-radius: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Test : position précise dans le bâtiment</h1>
+    <p>Ce test vérifie si votre téléphone peut suivre sa <b>position</b> pendant la visite (pas seulement son orientation), grâce à la réalité augmentée de Chrome (ARCore).</p>
+    <p>Ouvrez cette page dans <b>Chrome</b> sur Android, touchez « Démarrer », puis marchez quelques mètres et revenez à votre point de départ.</p>
+
+    <div class="card">
+      <div class="row"><span>Navigateur</span><span id="ua">…</span></div>
+      <div class="row"><span>Réalité augmentée (WebXR)</span><span id="xr" class="wait">…</span></div>
+    </div>
+
+    <button id="start" disabled>Démarrer le test</button>
+
+    <div class="card" id="results" style="display:none">
+      <div class="row"><span>Suivi de position</span><span id="r-pos" class="wait">…</span></div>
+      <div class="row"><span>Image caméra accessible</span><span id="r-cam" class="wait">…</span></div>
+      <div class="row"><span>Distance parcourue</span><span id="r-dist">…</span></div>
+      <div class="row"><span>Écart au retour au départ</span><span id="r-back">…</span></div>
+      <div class="row"><span>Interface par-dessus l'image</span><span id="r-dom" class="wait">…</span></div>
+    </div>
+    <p style="margin-top:16px;font-size:13px;color:#94a3b8">Envoyez une capture d'écran de ce résultat : elle dit si la visite peut retenir l'emplacement de chaque élément pendant toute la visite.</p>
+  </main>
+
+  <div id="overlay">
+    <canvas id="trail" width="300" height="300"></canvas>
+    <div class="panel">
+      <div class="big" id="o-pos">x 0,00 · y 0,00 · z 0,00 m</div>
+      <div class="small" id="o-info">Bougez lentement le téléphone pour démarrer le suivi…</div>
+      <button id="stop">Terminer le test</button>
+    </div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const fmt = v => v.toFixed(2).replace('.', ',');
+    const set = (id, text, cls) => { const el = $(id); el.textContent = text; if (cls) el.className = cls; };
+    $('ua').textContent = /Firefox/i.test(navigator.userAgent) ? 'Firefox' : /Chrome/i.test(navigator.userAgent) ? 'Chrome' : /Safari/i.test(navigator.userAgent) ? 'Safari' : 'autre';
+
+    let session = null;
+    const state = { tracked: 0, start: null, last: null, dist: 0, minBack: Infinity, leftStart: false, cam: null, trail: [] };
+
+    (async () => {
+      if (!navigator.xr) { set('xr', 'non disponible', 'ko'); return; }
+      try {
+        const ok = await navigator.xr.isSessionSupported('immersive-ar');
+        set('xr', ok ? 'disponible' : 'non disponible', ok ? 'ok' : 'ko');
+        $('start').disabled = !ok;
+      } catch (e) { set('xr', 'erreur', 'ko'); }
+    })();
+
+    function drawTrail() {
+      const c = $('trail'); const g = c.getContext('2d');
+      g.clearRect(0, 0, c.width, c.height);
+      g.fillStyle = '#facc15'; g.strokeStyle = '#facc15'; g.lineWidth = 4;
+      const scale = 30; // 1 m = 30 px (10 m de côté)
+      g.beginPath();
+      state.trail.forEach((p, i) => { const x = 150 + p.x * scale, y = 150 + p.z * scale; i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      g.stroke();
+      g.fillStyle = '#4ade80'; g.beginPath(); g.arc(150, 150, 7, 0, 7); g.fill();
+    }
+
+    $('start').onclick = async () => {
+      $('results').style.display = 'block';
+      try {
+        session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local'],
+          optionalFeatures: ['dom-overlay', 'camera-access', 'anchors', 'hit-test'],
+          domOverlay: { root: $('overlay') },
+        });
+      } catch (e) {
+        set('r-pos', 'refusé : ' + (e.message || e), 'ko');
+        return;
+      }
+      $('overlay').style.display = 'block';
+      set('r-dom', session.domOverlayState ? 'oui' : 'non', session.domOverlayState ? 'ok' : 'ko');
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl2', { xrCompatible: true }) || canvas.getContext('webgl', { xrCompatible: true });
+      await gl.makeXRCompatible?.();
+      session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+      const space = await session.requestReferenceSpace('local');
+      const binding = typeof XRWebGLBinding !== 'undefined' ? new XRWebGLBinding(session, gl) : null;
+
+      session.addEventListener('end', () => {
+        $('overlay').style.display = 'none';
+        set('r-pos', state.tracked > 30 ? 'oui' : 'non', state.tracked > 30 ? 'ok' : 'ko');
+        set('r-cam', state.cam ? `oui (${state.cam})` : 'non', state.cam ? 'ok' : 'ko');
+        set('r-dist', `${fmt(state.dist)} m`);
+        set('r-back', state.leftStart && isFinite(state.minBack) ? `${fmt(state.minBack)} m` : 'pas revenu au départ');
+        session = null;
+      });
+
+      const onFrame = (t, frame) => {
+        session.requestAnimationFrame(onFrame);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, session.renderState.baseLayer.framebuffer);
+        const pose = frame.getViewerPose(space);
+        if (!pose) { $('o-info').textContent = 'Suivi perdu : bougez lentement, visez une zone bien éclairée'; return; }
+        const p = pose.transform.position;
+        if (!pose.emulatedPosition) state.tracked++;
+        if (!state.start) state.start = { x: p.x, y: p.y, z: p.z };
+        if (state.last) {
+          const d = Math.hypot(p.x - state.last.x, p.y - state.last.y, p.z - state.last.z);
+          if (d < 0.5) state.dist += d;
+        }
+        state.last = { x: p.x, y: p.y, z: p.z };
+        const fromStart = Math.hypot(p.x - state.start.x, p.z - state.start.z);
+        if (fromStart > 2) state.leftStart = true;
+        if (state.leftStart) state.minBack = Math.min(state.minBack, fromStart);
+        if (!state.trail.length || Math.hypot(p.x - state.trail.at(-1).x, p.z - state.trail.at(-1).z) > 0.05) {
+          state.trail.push({ x: p.x - state.start.x, z: p.z - state.start.z });
+          drawTrail();
+        }
+        if (binding && !state.cam) {
+          for (const view of pose.views) {
+            if (view.camera) {
+              try { binding.getCameraImage(view.camera); state.cam = `${view.camera.width}×${view.camera.height}`; } catch (e) {}
+            }
+          }
+        }
+        $('o-pos').textContent = `x ${fmt(p.x)} · y ${fmt(p.y)} · z ${fmt(p.z)} m`;
+        $('o-info').textContent = `${pose.emulatedPosition ? 'Position estimée (suivi limité)' : 'Position suivie'} · ${fmt(state.dist)} m parcourus · ${fmt(fromStart)} m du départ${state.cam ? ` · caméra ${state.cam}` : ''}`;
+      };
+      session.requestAnimationFrame(onFrame);
+    };
+    $('stop').onclick = () => session?.end();
+  </script>
+</body>
+</html>
